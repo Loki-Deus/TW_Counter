@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  tw-counter:
+    build:
+      context: https://github.com/Loki-Deus/TW_Counter.git
+      dockerfile: Dockerfile
+    image: tw-counter:latest
+    container_name: tw-counter
+    restart: unless-stopped
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - GUILD_ID=${GUILD_ID}
+      - MEMBER_ROLE_ID=${MEMBER_ROLE_ID}
+      - MANAGER_IDS=${MANAGER_IDS}
+      - DATA_DIR=/app/data
+      - BOT_TIMEZONE=${BOT_TIMEZONE:-Europe/Vienna}
+    volumes:
+      - tw-counter-data:/app/data
+
+volumes:
+  tw-counter-data:
+    external: true
+    name: tw_counter_tw-counter-data
