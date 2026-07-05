@@ -44,14 +44,6 @@ CREATE INDEX idx_reports_counter ON reports(counter_id);
 
 `delta` ist eine generierte Spalte (SQLite ≥ 3.31, Python 3.12 erfüllt das) — von der Engine abgeleitet, nie applikationsseitig geschrieben. Exaktes Schema in `db.py`.
 
-## Charakterliste — warum kein Live-Fetch
-
-Die Autocomplete-Daten für Charakternamen kommen **nicht** von einer API. `swgoh.gg/characters/` läuft hinter einer aktiven Cloudflare-JS-Challenge; das wurde direkt getestet (curl unter Windows/schannel, curl unter WSL/OpenSSL mit identischem Browser-User-Agent, Python `requests`) — jeder automatisierte Client außer einem echten Browser bekommt `cf-mitigated: challenge` statt der Seite. Es gibt deshalb bewusst keinen Netzwerk-Fetch in `character_list.py`.
-
-Stattdessen: `swgoh.gg/characters/` im Browser öffnen, als HTML speichern, per `/tw_characterrefresh` (nur `OWNER_ID`) hochladen. Der Bot validiert (parst und zählt gefundene Charaktere) **bevor** er die bestehende Datei überschreibt — eine fehlgeschlagene Validierung lässt die zuletzt funktionierende Version unangetastet. Ergebnis wird zusätzlich nach `characters.json` gecacht und beim Start sowie im wöchentlichen `tasks.loop(hours=168)` erneut eingelesen (kein neuer Netzwerk-Request, nur ein erneutes Parsen der aktuell abgelegten Datei).
-
-Kein manuelles Update seit einer Weile → Autocomplete zeigt schlicht keine neuen Charaktere, fällt aber nie auf eine leere Liste zurück, solange irgendwann einmal erfolgreich hochgeladen wurde.
-
 ## Setup
 
 ### 1. Discord-Anwendung
