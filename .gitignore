@@ -1,0 +1,26 @@
+# Environment variables — never commit this
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+venv/
+.venv/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Runtime data (persistent, kept in DATA_DIR on the server / local machine).
+# Whole directory, not individual filenames — counters.db, characters.json,
+# and swgoh_characters.html all live here, and enumerating them one at a
+# time is exactly how swgoh_characters.html slipped through and got
+# committed once already.
+data/
