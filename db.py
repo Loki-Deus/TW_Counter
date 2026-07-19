@@ -207,3 +207,23 @@ def get_bucket_stats(defending_leader: str) -> list[sqlite3.Row]:
             """,
             (defending_leader,),
         ).fetchall()
+
+
+def get_top_reporters(limit: int = 3) -> list[sqlite3.Row]:
+    """
+    Aggregation für /tw_celebrate: zählt reports pro reported_by_id.
+    Reine ID-Zählung — Anzeige-Namen werden nicht in reports gespeichert,
+    Auflösung zu Discord-Displaynamen ist Sache von bot.py (Live-Lookup
+    über interaction.guild, siehe resolve_display_name()).
+    """
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT reported_by_id, COUNT(*) AS report_count
+            FROM reports
+            GROUP BY reported_by_id
+            ORDER BY report_count DESC, reported_by_id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()

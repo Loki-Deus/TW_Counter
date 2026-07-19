@@ -174,7 +174,7 @@ def format_lookup_table(
         losses = stats[attacker][bucket]["losses"]
         total = wins + losses
         if total == 0:
-            return "keine Berichte"
+            return ""
         pct = round((wins / total) * 100)
         return f"{pct}% ({wins}/{losses})"
 
@@ -512,6 +512,50 @@ async def tw_characterrefresh(
     )
 
 
+# ── /tw_celebrate ─────────────────────────────────────────────────────────
+
+
+async def resolve_display_name(guild: discord.Guild, user_id: str) -> str:
+    """
+    Löst eine reported_by_id zu einem aktuellen Displaynamen auf. Cache
+    zuerst (guild.get_member), sonst API-Fetch. Schlägt beides fehl — z.B.
+    Mitglied hat den Server verlassen — wird die rohe ID als Fallback
+    angezeigt statt die ganze Auflösung abzubrechen.
+    """
+    try:
+        member = guild.get_member(int(user_id))
+        if member is None:
+            member = await guild.fetch_member(int(user_id))
+        return member.display_name
+    except (discord.NotFound, discord.HTTPException, ValueError):
+        return f"Unbekannter Nutzer ({user_id})"
+
+
+@tree.command(
+    name="tw_celebrate",
+    description="Zeigt die Top 3 Melder der meisten TW-Reports",
+)
+async def tw_celebrate(interaction: discord.Interaction):
+    top = db.get_top_reporters(limit=3)
+    if not top:
+        await interaction.response.send_message(
+            "Noch keine Reports vorhanden.", ephemeral=True
+        )
+        return
+
+    # defer, weil fetch_member() bei Cache-Miss einen API-Roundtrip macht —
+    # das kann Discords 3-Sekunden-Fenster für die initiale Response reißen.
+    await interaction.response.defer()
+
+    medals = ("🥇", "🥈", "🥉")
+    lines = []
+    for medal, row in zip(medals, top):
+        name = await resolve_display_name(interaction.guild, row["reported_by_id"])
+        lines.append(f"{medal} **{name}** — {row['report_count']} Reports")
+
+    await interaction.followup.send("## TW-Report-Champions\n\n" + "\n".join(lines))
+
+
 # ── /tw_help ──────────────────────────────────────────────────────────────
 
 
@@ -532,6 +576,8 @@ async def tw_help(interaction: discord.Interaction):
         "**`/tw_characterrefresh datei`** — *Owner*\n"
         "Lädt eine manuell gespeicherte Kopie von swgoh.gg/characters/ hoch und "
         "aktualisiert die Autocomplete-Daten sofort.\n\n"
+        "**`/tw_celebrate`** — *alle*\n"
+        "Zeigt die Top 3 Melder der meisten TW-Reports.\n\n"
         "**`/tw_help`** — Zeigt diese Übersicht.\n\n"
         "-# Relic-Delta = Angreifer-Relic − Verteidiger-Relic. "
         "≤ -3 unterlegen, -2..+2 ausgeglichen, ≥ +3 überlegen."
