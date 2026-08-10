@@ -415,6 +415,13 @@ async def on_message(message: discord.Message):
     nie mehr verarbeitet. Aktuell nutzt der Bot ausschließlich Slash-Commands
     über tree, aber das hier ist der dokumentierte discord.py-Standard, um
     das nicht unbeabsichtigt zu brechen, falls sich das mal ändert.
+
+    channel.send() statt reply(): reply() erzeugt eine Message-Reference
+    (die "antwortet auf ↩"-UI) und braucht dafür die Berechtigung "Read
+    Message History" -- die die ursprüngliche OAuth2-Einladung nie vergeben
+    hat (siehe README, Abschnitt "Discord-Anwendung": nur "Send Messages").
+    Eine normale Nachricht statt eines Threads spart diese zusätzliche
+    Berechtigung komplett ein, statt sie nachträglich anzufordern.
     """
     if message.author.bot:
         # Deckt auch den Bot selbst ab (bot.user.bot ist True) -- verhindert,
@@ -429,7 +436,7 @@ async def on_message(message: discord.Message):
         frage = frage.strip()
 
         if not frage:
-            await message.reply(
+            await message.channel.send(
                 "Ja? Frag mich etwas, z.B. 'was kontert Darth Vader?'"
             )
         else:
@@ -441,11 +448,11 @@ async def on_message(message: discord.Message):
                         "smartbot.answer_query fehlgeschlagen für Mention-Frage: %s",
                         frage,
                     )
-                    await message.reply(
+                    await message.channel.send(
                         "Da ist etwas schiefgelaufen. Bitte versuch es später erneut."
                     )
                     return
-            await message.reply(answer)
+            await message.channel.send(answer)
 
     await bot.process_commands(message)
 
