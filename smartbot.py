@@ -30,6 +30,22 @@ Sprache: das Modell erkennt die Sprache der Anfrage selbst (de/en) und
 antwortet in derselben Sprache — sowohl bei report_unresolved (über das
 `language`-Feld, lokal ins passende Template gemappt) als auch im
 Syntheseschritt (per Prompt-Instruktion).
+
+Kosten: der Resolve-Call trägt den vollen character_names-Enum als
+Tool-Schema mit und dominiert damit die Kosten praktisch unabhängig von der
+gestellten Frage. _SYSTEM_PROMPT_BLOCKS trägt deshalb einen
+cache_control-Breakpoint (5-Minuten-TTL), der laut Anthropics
+Präfix-Reihenfolge tools -> system -> messages sowohl den System-Prompt
+als auch die Tool-Definitionen (inkl. Enum) kumulativ abdeckt. Ob das bei
+der aktuellen Charaktermenge tatsächlich greift, hängt von Haiku 4.5s
+Mindestgröße für cachebare Präfixe ab (4096 Tokens, Stand dieser Änderung)
+-- answer_query() loggt cache_creation_input_tokens/cache_read_input_tokens
+pro Resolve-Call, um das ohne Rätselraten am Log ablesen zu können.
+
+Antwortlänge: der Syntheseschritt ist bewusst auf 1-2 Sätze und die
+stärksten Konter beschränkt (Prompt-Instruktion + max_tokens=200 als
+Backstop) -- keine vollständige Aufzählung aller Leader mit irgendwelchen
+positiven Daten mehr.
 """
 
 import json
@@ -101,10 +117,42 @@ When calling report_unresolved, pass extracted_name exactly as the user \
 wrote it (do not correct or normalize it), and language as the language \
 the user's question was written in ("en" or "de")."""
 
+# cache_control auf dem System-Prompt-Block: Anthropics Caching ist
+# präfix-basiert in fester Reihenfolge tools -> system -> messages (siehe
+# https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
+# Ein einziger Breakpoint hier deckt kumulativ ALLES davor ab -- also auch
+# die Tools inkl. des ~330-Namen-Enums, ohne dass tools[] selbst einen
+# eigenen cache_control-Eintrag braucht.
+#
+# WICHTIG, unbedingt selbst verifizieren: Claude Haiku 4.5 hat eine
+# Mindestgröße von 4096 Tokens für einen cachebaren Präfix (offizielle
+# Doku, Stand dieser Änderung). Liegt der tatsächliche Präfix (Enum +
+# Tool-Schemas + dieser System-Prompt + Anthropics automatischer Tool-Use-
+# Overhead) darunter, greift NICHTS -- kein Fehler, einfach stillschweigend
+# kein Caching. Ob das bei aktuell 333 Charakteren der Fall ist, ist ohne
+# eine echte Messung nicht seriös zu behaupten -- deshalb das Logging der
+# usage-Felder unten in answer_query(). cache_creation_input_tokens und
+# cache_read_input_tokens beide 0 im Log heißt: Präfix zu kurz, Caching
+# greift nicht.
+_SYSTEM_PROMPT_BLOCKS = [
+    {
+        "type": "text",
+        "text": _SYSTEM_PROMPT,
+        "cache_control": {"type": "ephemeral"},
+    }
+]
+
 _SYNTHESIS_SYSTEM_PROMPT = """Answer the user's question using ONLY the data \
 in the tool result below — never state a win/loss figure or bucket that \
 isn't present in it. Respond in the same language the user's question was \
-written in. Keep it to a few sentences of prose, not a table."""
+written in.
+
+Keep it short: one to two sentences. Name only the strongest counter(s) — \
+the one or two attackers with the clearly best results against this \
+defender. Do not enumerate every leader with any positive data at all; a \
+long list of marginal options is not more helpful, it reads as noise. If \
+nothing clearly stands out, say so briefly instead of listing everything \
+you have."""
 
 
 def _build_tools(character_names: list[str]) -> list[dict]:
@@ -206,10 +254,22 @@ async def answer_query(question: str, character_names: list[str]) -> str:
     response = await client.messages.create(
         model=MODEL,
         max_tokens=200,
-        system=_SYSTEM_PROMPT,
+        system=_SYSTEM_PROMPT_BLOCKS,
         tools=tools,
         tool_choice={"type": "any"},
         messages=messages,
+    )
+
+    # Sichtbar machen, ob der Cache-Breakpoint oben tatsächlich greift --
+    # siehe Kommentar bei _SYSTEM_PROMPT_BLOCKS zur 4096-Token-Mindestgröße
+    # von Haiku 4.5. cache_creation=Schreiben (teurer, 1.25x), cache_read=
+    # Lesen (günstiger, 0.1x), beide 0 = kein Caching für diesen Call.
+    usage = response.usage
+    logger.info(
+        "Resolve-Call Tokens: input=%d cache_creation=%d cache_read=%d",
+        usage.input_tokens,
+        getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        getattr(usage, "cache_read_input_tokens", 0) or 0,
     )
 
     tool_use = next((b for b in response.content if b.type == "tool_use"), None)
@@ -262,7 +322,7 @@ async def answer_query(question: str, character_names: list[str]) -> str:
 
     final = await client.messages.create(
         model=MODEL,
-        max_tokens=400,
+        max_tokens=200,
         system=_SYNTHESIS_SYSTEM_PROMPT,
         messages=messages,
     )
