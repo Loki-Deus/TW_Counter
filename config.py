@@ -39,6 +39,13 @@ OWNER_ID = int(os.getenv("OWNER_ID"))
 DATA_DIR = os.getenv("DATA_DIR", ".")
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Vienna")
 
+# Für smartbot.py (/tw_ask). Wie DISCORD_TOKEN bewusst über os.getenv (kein
+# int()-Cast, kein Crash beim Bot-Start, falls der Key fehlt) -- der Fehler
+# soll erst beim ersten tatsächlichen /tw_ask-Aufruf auftreten, nicht schon
+# beim Start des gesamten Bots wegen einer Funktion, die noch niemand benutzt
+# hat.
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
 DB_PATH = os.path.join(DATA_DIR, "counters.db")
 
 # Relic-Eingabevalidierung (/tw_report). Fängt Tippfehler (z. B. "90") ab,

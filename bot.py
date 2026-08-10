@@ -1,13 +1,25 @@
 """
 TW-Counter-Bot — Discord-Bot für SWGOH-Territory-War-Konter.
-Verdrahtet config.py (Env/Konstanten), db.py (Event-Log-Modell) und
-character_list.py (Autocomplete-Datenquelle) zu fünf Slash-Commands:
-/tw_add, /tw_report, /tw_lookup, /tw_delete, /tw_help.
+Verdrahtet config.py (Env/Konstanten), db.py (Event-Log-Modell),
+character_list.py (Autocomplete-Datenquelle) und smartbot.py
+(natürlichsprachlicher Query-Layer über Claude) zu den Slash-Commands
+/tw_add, /tw_report, /tw_lookup, /tw_ask, /tw_delete, /tw_characterrefresh,
+/tw_celebrate, /tw_help.
+
+Bewusst keine feste Anzahl mehr genannt (frühere Version sagte "fünf" und
+lief der tatsächlichen Command-Liste zweimal in Folge hinterher) -- bei der
+nächsten Erweiterung reicht es, den Namen oben in die Liste einzufügen,
+ohne eine Zahl mitpflegen zu müssen.
 
 Berechtigungsmodell: zwei unabhängige Rollen ohne Administrator-Override.
 SPECIALIST_ROLE_ID gate für /tw_add, MEMBER_ROLE_ID für /tw_report.
 /tw_delete erfordert Administrator ODER Mitgliedschaft in MANAGER_IDS.
-/tw_lookup und /tw_help sind für alle offen.
+/tw_lookup, /tw_ask, /tw_celebrate und /tw_help sind für alle offen.
+
+Natürlichsprachliche Anfragen laufen über zwei Trigger auf denselben
+Query-Layer: den Slash-Command /tw_ask und eine @mention des Bots in einer
+normalen Nachricht ("@TW-Counter was kontert Darth Vader?") -- siehe
+on_message() und smartbot.py.
 
 /tw_report deklariert den Parameter `verteidiger` vor `angreifer`, weil die
 angreifer-Autocomplete interaction.namespace.verteidiger liest und damit nur
@@ -24,6 +36,7 @@ from discord.ext.commands import Bot
 import config
 import db
 import character_list
+import smartbot
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -33,6 +46,13 @@ logger = logging.getLogger(__name__)
 # Keine Intents.members nötig: nichts im Code enumeriert role.members, alle
 # Berechtigungsprüfungen laufen über interaction.user direkt. Das Privileged
 # Gateway Intent "Server Members" muss im Developer Portal nicht aktiviert werden.
+#
+# Ebenso KEIN Intents.message_content nötig, obwohl bot.py weiter unten einen
+# eigenen on_message-Handler für @mention-Anfragen definiert: Discord liefert
+# message.content für Nachrichten, die den Bot mentionen, auch ohne dieses
+# privilegierte Intent (dokumentierte Ausnahme, siehe Kommentar bei
+# on_message). Zwei Features (/tw_ask und @mention), null privilegierte
+# Intents -- bewusst so gehalten, nicht aus Versehen unvollständig.
 intents = discord.Intents.default()
 bot: Bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
@@ -353,6 +373,83 @@ async def tw_lookup(interaction: discord.Interaction, verteidiger: str):
 tw_lookup.autocomplete("verteidiger")(character_autocomplete)
 
 
+# ── /tw_ask & @mention ──────────────────────────────────────────────────
+# Zwei Trigger für denselben Query-Layer (smartbot.py): der Slash-Command
+# /tw_ask und eine @mention der Bot-Identität in einer normalen Nachricht
+# ("@TW-Counter was kontert Darth Vader?"). Beide rufen dieselbe
+# smartbot.answer_query() auf -- keine doppelte Logik, nur zwei Einstiege.
+#
+# Der @mention-Weg braucht KEINEN privilegierten Message Content Intent:
+# Discord liefert message.content für Nachrichten, die den Bot mentionen,
+# auch ohne dieses Intent -- eine dokumentierte Ausnahme, kein Zufall
+# (https://docs.discord.com/developers/gateway/you-might-not-need-a-privileged-intent,
+# Abschnitt "messages in which it is mentioned"). intents bleibt deshalb
+# unverändert bei Intents.default() -- siehe Kommentar bei dessen Definition
+# oben, der jetzt für zwei Features statt einem gilt.
+
+
+@tree.command(
+    name="tw_ask",
+    description="Stellt eine Frage in natürlicher Sprache, z.B. 'was kontert Darth Vader?'",
+)
+@app_commands.describe(frage="Deine Frage, auf Deutsch oder Englisch")
+async def tw_ask(interaction: discord.Interaction, frage: str):
+    await interaction.response.defer()
+    try:
+        answer = await smartbot.answer_query(frage, character_names)
+    except Exception:
+        logger.exception("smartbot.answer_query fehlgeschlagen für Frage: %s", frage)
+        await interaction.followup.send(
+            "Da ist etwas schiefgelaufen. Bitte versuch es später erneut."
+        )
+        return
+    await interaction.followup.send(answer)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    """
+    Eigener on_message-Handler ersetzt commands.Bot's Default vollständig --
+    deshalb der explizite bot.process_commands(message)-Aufruf am Ende, sonst
+    würden eventuelle "!"-Prefix-Commands (command_prefix="!") stillschweigend
+    nie mehr verarbeitet. Aktuell nutzt der Bot ausschließlich Slash-Commands
+    über tree, aber das hier ist der dokumentierte discord.py-Standard, um
+    das nicht unbeabsichtigt zu brechen, falls sich das mal ändert.
+    """
+    if message.author.bot:
+        # Deckt auch den Bot selbst ab (bot.user.bot ist True) -- verhindert,
+        # dass eine eigene Antwort sich selbst erneut mentioned und eine
+        # Endlosschleife auslöst.
+        return
+
+    if bot.user in message.mentions:
+        frage = message.content
+        for pattern in (f"<@{bot.user.id}>", f"<@!{bot.user.id}>"):
+            frage = frage.replace(pattern, "")
+        frage = frage.strip()
+
+        if not frage:
+            await message.reply(
+                "Ja? Frag mich etwas, z.B. 'was kontert Darth Vader?'"
+            )
+        else:
+            async with message.channel.typing():
+                try:
+                    answer = await smartbot.answer_query(frage, character_names)
+                except Exception:
+                    logger.exception(
+                        "smartbot.answer_query fehlgeschlagen für Mention-Frage: %s",
+                        frage,
+                    )
+                    await message.reply(
+                        "Da ist etwas schiefgelaufen. Bitte versuch es später erneut."
+                    )
+                    return
+            await message.reply(answer)
+
+    await bot.process_commands(message)
+
+
 # ── /tw_delete ────────────────────────────────────────────────────────────
 
 
@@ -571,6 +668,10 @@ async def tw_help(interaction: discord.Interaction):
         "Meldet ein Kampfergebnis für einen bereits existierenden Konter.\n\n"
         "**`/tw_lookup verteidiger`** — *alle*\n"
         "Zeigt alle Konter gegen einen Verteidiger, sortiert nach Ausgeglichen-Quote.\n\n"
+        "**`/tw_ask frage`** — *alle*\n"
+        "Beantwortet eine Frage in natürlicher Sprache (Deutsch oder Englisch), "
+        "z.B. 'was kontert Darth Vader?'. Alternativ: den Bot in einer normalen "
+        "Nachricht @mentionen und die Frage direkt dranschreiben.\n\n"
         "**`/tw_delete verteidiger angreifer`** — *Manager/Admin*\n"
         "Löscht einen Konter samt aller Reports, nach Bestätigung.\n\n"
         "**`/tw_characterrefresh datei`** — *Owner*\n"
