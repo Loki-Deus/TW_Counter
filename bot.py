@@ -86,7 +86,7 @@ tree = bot.tree
 # deployed ist -- Commands, Refresh-Task und die zugehörigen /tw_help-
 # Einträge sind vollständig fertig, nur inaktiv, keine weiteren
 # Codeänderungen nötig.
-ROSTER_FEATURE_ENABLED = False
+ROSTER_FEATURE_ENABLED = True
 
 # In-Memory-Cache der Charakternamen fürs Autocomplete. Wird beim Start aus
 # character_list.get_characters() befüllt und wöchentlich über
