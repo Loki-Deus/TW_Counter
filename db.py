@@ -165,18 +165,20 @@ def _migrate_players_schema(conn: sqlite3.Connection) -> None:
     Mitgliederliste läuft, nicht mehr nur für einzeln per /tw_register
     verknüpfte Discord-Nutzer.
 
-    ROSTER_FEATURE_ENABLED stand in bot.py bislang auf False -- players/
-    roster_units sollten also in der Praxis leer sein. Die alte
-    Tabellenform wird trotzdem per PRAGMA-Check erkannt und samt Inhalt
-    gedroppt, statt stillschweigend mit falscher Spaltenbedeutung
-    weiterverwendet zu werden. Das ist ein bewusster, lautstark geloggter
-    Kompromiss für einen Schema-Umbau vor echtem Produktivbetrieb dieses
-    Features -- kein Muster für spätere Migrationen mit echten Daten
-    (siehe _migrate_reports_add_banners() unten für den datenerhaltenden
-    Ansatz, falls das mal nötig ist).
+    Erkennungslogik, siehe Bug-Historie: die ursprüngliche Version prüfte
+    "ally_code" not in columns" -- FALSCH, weil die alte Tabellenform
+    ally_code BEREITS als gewöhnliche UNIQUE-Spalte hatte, nur nicht als
+    Primärschlüssel. Diese Prüfung griff nie, players wurde nie gedroppt,
+    und SCHEMAs "CREATE INDEX idx_roster_units_ally ON roster_units(ally_code)"
+    schlug beim ersten echten Produktivstart mit "no such column: ally_code"
+    fehl -- die ALTE roster_units-Tabelle (Spalte discord_id, kein
+    ally_code) blieb durch die wirkungslose CREATE TABLE IF NOT EXISTS
+    bestehen. registered_at existiert dagegen NUR in der alten Form (siehe
+    SCHEMA oben: die neue players-Definition hat dieses Feld nicht mehr) --
+    eindeutiger Marker statt eines mehrdeutigen.
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(players)").fetchall()}
-    if columns and "ally_code" not in columns:
+    if "registered_at" in columns:
         logger.warning(
             "players-Tabelle in alter Form gefunden (discord_id als "
             "Primärschlüssel) -- wird samt roster_units gedroppt und in "
