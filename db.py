@@ -76,18 +76,18 @@ CREATE TABLE IF NOT EXISTS zones (
     created_at INTEGER NOT NULL
 );
 
--- Roster-Mirror (siehe roster.py): players ist die Ally-Code-Registrierung
--- pro Discord-Nutzer, roster_units der zuletzt synchronisierte Kaderstand.
--- Wie counters/reports/zones aktuell OHNE guild_id -- konsistent mit dem
--- restlichen Schema, das ebenfalls (noch) von genau einer Gilde ausgeht.
--- Bei der später geplanten Mandantenfähigkeit müsste guild_id hier genauso
--- ergänzt werden wie bei counters, nicht isoliert vorgezogen.
+-- Roster-Mirror (siehe roster.py). players ist über ally_code verkettet,
+-- NICHT über discord_id -- der Refresh läuft guild-weit über comlinks
+-- Gilden-Mitgliederliste (fetch_guild_members()), nicht mehr nur für
+-- Discord-Nutzer, die manuell /tw_register genutzt haben. Ein Spieler hat
+-- also Rosterdaten, OHNE je einen Discord-Account verknüpft zu haben --
+-- discord_id ist deshalb nullable, nicht mehr der Primärschlüssel.
+-- /tw_register setzt nur noch diese optionale Verknüpfung.
 CREATE TABLE IF NOT EXISTS players (
-    discord_id    TEXT PRIMARY KEY,
-    ally_code     TEXT NOT NULL UNIQUE,
-    player_name   TEXT,
-    registered_at INTEGER NOT NULL,
-    last_synced   INTEGER
+    ally_code   TEXT PRIMARY KEY,
+    player_name TEXT,
+    discord_id  TEXT UNIQUE,
+    last_synced INTEGER
 );
 
 -- roster_units wird bei jedem Refresh komplett ersetzt (DELETE + INSERT,
@@ -95,15 +95,28 @@ CREATE TABLE IF NOT EXISTS players (
 -- ohnehin den vollständigen aktuellen Kaderstand, Diffing brächte hier
 -- keinen Vorteil.
 CREATE TABLE IF NOT EXISTS roster_units (
-    discord_id  TEXT NOT NULL REFERENCES players(discord_id) ON DELETE CASCADE,
+    ally_code   TEXT NOT NULL REFERENCES players(ally_code) ON DELETE CASCADE,
     unit_id     TEXT NOT NULL,
     rarity      INTEGER,
     gear_tier   INTEGER,
     relic_tier  INTEGER,
     omicrons    TEXT NOT NULL DEFAULT '[]',
-    PRIMARY KEY (discord_id, unit_id)
+    PRIMARY KEY (ally_code, unit_id)
 );
-CREATE INDEX IF NOT EXISTS idx_roster_units_discord ON roster_units(discord_id);
+CREATE INDEX IF NOT EXISTS idx_roster_units_ally ON roster_units(ally_code);
+
+-- Singleton-Tabelle (id per CHECK auf genau 1 erzwungen): die interne
+-- SWGOH-Gilden-ID, NICHT zu verwechseln mit config.GUILD_ID (Discord-
+-- Server-ID für die Slash-Command-Registrierung -- zwei völlig
+-- unabhängige Namensräume, die nur zufällig beide "Gilde"/"guild" heißen).
+-- Wird über /tw_guild_set gesetzt, nicht per Env-Var -- ein einmaliger
+-- Admin-Vorgang, kein Redeploy-Grund.
+CREATE TABLE IF NOT EXISTS swgoh_guild (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    guild_id   TEXT NOT NULL,
+    guild_name TEXT,
+    set_at     INTEGER NOT NULL
+);
 """
 
 # Einzige SQL-seitige Quelle für die Bucket-Grenzen — interpoliert aus
@@ -133,8 +146,45 @@ def get_connection():
 
 def init_db() -> None:
     with get_connection() as conn:
+        _migrate_players_schema(conn)
         conn.executescript(SCHEMA)
         _migrate_reports_add_banners(conn)
+
+
+def _migrate_players_schema(conn: sqlite3.Connection) -> None:
+    """
+    MUSS vor conn.executescript(SCHEMA) laufen, nicht danach -- anders als
+    _migrate_reports_add_banners() unten. CREATE TABLE IF NOT EXISTS legt
+    eine Tabelle mit der ALTEN Spaltenform nicht neu an, sie existiert ja
+    schon; die alte Form muss also VORHER weg, damit SCHEMAs CREATE TABLE
+    danach mit der neuen Form frisch greift.
+
+    Frühere Version von players nutzte discord_id als Primärschlüssel
+    (Selbstregistrierung pro Discord-Nutzer); ally_code ist jetzt der
+    Primärschlüssel, weil der Roster-Refresh guild-weit über comlinks
+    Mitgliederliste läuft, nicht mehr nur für einzeln per /tw_register
+    verknüpfte Discord-Nutzer.
+
+    ROSTER_FEATURE_ENABLED stand in bot.py bislang auf False -- players/
+    roster_units sollten also in der Praxis leer sein. Die alte
+    Tabellenform wird trotzdem per PRAGMA-Check erkannt und samt Inhalt
+    gedroppt, statt stillschweigend mit falscher Spaltenbedeutung
+    weiterverwendet zu werden. Das ist ein bewusster, lautstark geloggter
+    Kompromiss für einen Schema-Umbau vor echtem Produktivbetrieb dieses
+    Features -- kein Muster für spätere Migrationen mit echten Daten
+    (siehe _migrate_reports_add_banners() unten für den datenerhaltenden
+    Ansatz, falls das mal nötig ist).
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(players)").fetchall()}
+    if columns and "ally_code" not in columns:
+        logger.warning(
+            "players-Tabelle in alter Form gefunden (discord_id als "
+            "Primärschlüssel) -- wird samt roster_units gedroppt und in "
+            "neuer Form (ally_code als Primärschlüssel) neu angelegt. "
+            "Vorherige Ally-Code-Registrierungen sind danach weg."
+        )
+        conn.execute("DROP TABLE IF EXISTS roster_units")
+        conn.execute("DROP TABLE IF EXISTS players")
 
 
 def _migrate_reports_add_banners(conn: sqlite3.Connection) -> None:
@@ -363,54 +413,97 @@ def get_zone(name: str) -> sqlite3.Row | None:
         return conn.execute("SELECT * FROM zones WHERE name = ?", (name,)).fetchone()
 
 
-def register_player(discord_id: str, ally_code: str) -> None:
+def set_swgoh_guild(guild_id: str, guild_name: str | None) -> None:
     """
-    Legt einen Spieler an oder aktualisiert den Ally-Code, falls sich
-    dieser geändert hat (z.B. Accountwechsel) -- discord_id ist der
-    stabile Schlüssel, nicht der Ally-Code. Setzt bewusst KEIN
-    last_synced -- das passiert erst in save_roster(), nach dem ersten
-    tatsächlich erfolgreichen Comlink-Fetch, nicht schon bei der reinen
-    Registrierung.
+    Setzt/ersetzt die eine hinterlegte SWGOH-Gilden-ID -- Singleton, id=1
+    per CHECK-Constraint in SCHEMA erzwungen (dieser Bot verwaltet aktuell
+    genau eine Gilde). NICHT zu verwechseln mit config.GUILD_ID (Discord-
+    Server-ID).
     """
     with get_connection() as conn:
         conn.execute(
             """
-            INSERT INTO players (discord_id, ally_code, registered_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(discord_id) DO UPDATE SET ally_code = excluded.ally_code
+            INSERT INTO swgoh_guild (id, guild_id, guild_name, set_at)
+            VALUES (1, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                guild_id = excluded.guild_id,
+                guild_name = excluded.guild_name,
+                set_at = excluded.set_at
             """,
-            (discord_id, ally_code, int(time.time())),
+            (guild_id, guild_name, int(time.time())),
         )
 
 
-def get_all_registered_players() -> list[sqlite3.Row]:
-    """Für refresh_rosters_task und /tw_roster_refresh -- alle registrierten (discord_id, ally_code)."""
+def get_swgoh_guild() -> sqlite3.Row | None:
+    """None, wenn noch nie /tw_guild_set gelaufen ist."""
     with get_connection() as conn:
-        return conn.execute("SELECT discord_id, ally_code FROM players").fetchall()
+        return conn.execute("SELECT * FROM swgoh_guild WHERE id = 1").fetchone()
 
 
-def save_roster(discord_id: str, player_name: str, units: list[dict]) -> None:
+def upsert_player(ally_code: str, player_name: str) -> None:
     """
-    Ersetzt das gespeicherte Roster eines Spielers vollständig. `units`:
-    Liste von Dicts mit unit_id/rarity/gear_tier/relic_tier/omicrons, wie
-    von roster.fetch_roster() geliefert -- diese Funktion selbst weiß
-    nichts von Comlink, nur vom bereits normalisierten Format.
+    Legt einen Spieler an oder aktualisiert nur seinen Namen -- fasst
+    discord_id NICHT an. Für den guild-weiten Refresh: jedes über
+    roster.fetch_guild_members() gefundene Mitglied bekommt hier einen
+    Datensatz, unabhängig davon, ob es je /tw_register genutzt hat.
     """
     with get_connection() as conn:
         conn.execute(
-            "UPDATE players SET player_name = ?, last_synced = ? WHERE discord_id = ?",
-            (player_name, int(time.time()), discord_id),
+            """
+            INSERT INTO players (ally_code, player_name)
+            VALUES (?, ?)
+            ON CONFLICT(ally_code) DO UPDATE SET player_name = excluded.player_name
+            """,
+            (ally_code, player_name),
         )
-        conn.execute("DELETE FROM roster_units WHERE discord_id = ?", (discord_id,))
+
+
+def link_discord_id(ally_code: str, discord_id: str) -> None:
+    """
+    /tw_register: verknüpft eine Discord-ID mit einem Ally-Code. Legt
+    KEINEN neuen players-Datensatz an -- der Aufrufer (bot.py) ruft vorher
+    im selben Ablauf upsert_player() bzw. save_roster(), die das schon tun.
+    """
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE players SET discord_id = ? WHERE ally_code = ?",
+            (discord_id, ally_code),
+        )
+
+
+def get_all_players() -> list[sqlite3.Row]:
+    """
+    Alle bekannten Spieler, ob mit Discord verknüpft oder nicht -- nicht
+    für den Refresh selbst gebraucht (der geht über
+    roster.fetch_guild_members() direkt gegen comlink), sondern für Fälle,
+    in denen der aktuelle DB-Stand ohne neuen comlink-Call ausgelesen
+    werden soll.
+    """
+    with get_connection() as conn:
+        return conn.execute("SELECT * FROM players").fetchall()
+
+
+def save_roster(ally_code: str, player_name: str, units: list[dict]) -> None:
+    """
+    Ersetzt das gespeicherte Roster eines Spielers vollständig, über
+    ally_code. `units`: Liste von Dicts wie von roster.fetch_roster()
+    geliefert.
+    """
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE players SET player_name = ?, last_synced = ? WHERE ally_code = ?",
+            (player_name, int(time.time()), ally_code),
+        )
+        conn.execute("DELETE FROM roster_units WHERE ally_code = ?", (ally_code,))
         conn.executemany(
             """
             INSERT INTO roster_units
-                (discord_id, unit_id, rarity, gear_tier, relic_tier, omicrons)
+                (ally_code, unit_id, rarity, gear_tier, relic_tier, omicrons)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             [
                 (
-                    discord_id,
+                    ally_code,
                     u["unit_id"],
                     u["rarity"],
                     u["gear_tier"],

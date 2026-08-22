@@ -13,6 +13,12 @@ comlink-Instanz produktiv läuft -- Discord bekommt sie aktuell also gar
 nicht erst zum Registrieren angeboten. Auf True setzen, sobald comlink
 deployed ist.
 
+Wenn aktiv, läuft der Roster-Refresh guild-weit über comlinks
+Mitgliederliste (roster.fetch_guild_members()), nicht nur für einzeln per
+/tw_register verknüpfte Discord-Nutzer -- /tw_guild_set hinterlegt dafür
+einmalig die interne SWGOH-Gilden-ID. Kein manuelles Signup pro Spieler
+nötig; /tw_register verknüpft nur noch optional Discord-ID und Ally-Code.
+
 Bewusst keine feste Anzahl mehr genannt (frühere Version sagte "fünf" und
 lief der tatsächlichen Command-Liste zweimal in Folge hinterher) -- bei der
 nächsten Erweiterung reicht es, den Namen oben in die Liste einzufügen,
@@ -695,38 +701,91 @@ tw_zone_attack.autocomplete("verteidiger_3")(character_autocomplete)
 
 
 if ROSTER_FEATURE_ENABLED:
-    # /tw_register, /tw_roster_refresh, der Refresh-Task und dessen
-    # before_loop-Hook -- vollständig fertig, aber inaktiv, bis
+    # /tw_guild_set, /tw_register, /tw_roster_refresh, der Refresh-Task und
+    # dessen before_loop-Hook -- vollständig fertig, aber inaktiv, bis
     # ROSTER_FEATURE_ENABLED oben auf True gesetzt wird (siehe dortiger
     # Kommentar). Absichtlich per if-Block statt einzeln auskommentierter
     # Zeilen deaktiviert: @tree.command-Decorators laufen zur Import-
     # zeit, ein deaktivierter Block heißt hier also "Discord bekommt
     # diese Commands nie zum Registrieren angeboten", nicht nur "schlägt
     # beim Aufruf fehl".
-    # ── /tw_register & Roster-Refresh ────────────────────────────────────────
-    # Ally-Code-Registrierung (roster.py) -- Grundlage für eine spätere
-    # mitgliederliste=True-Auswertung in /tw_zone_attack (aktuell noch nicht
-    # verknüpft, siehe roster.py-Docstring: die Namensraum-Brücke
-    # defId<->Anzeigename fehlt noch).
+    # ── /tw_guild_set, /tw_register & Roster-Refresh ─────────────────────
+    # Guild-weiter Ansatz statt Einzel-Selbstregistrierung: /tw_guild_set
+    # hinterlegt EINMALIG die interne SWGOH-Gilden-ID (über einen
+    # beliebigen bekannten Ally-Code aufgelöst, siehe roster.resolve_guild_id()
+    # -- comlink hat keine Freitext-Gildensuche). Ab dann läuft der Refresh
+    # automatisch über die GESAMTE Gilde (roster.fetch_guild_members()),
+    # nicht nur über die, die zufällig /tw_register genutzt haben -- kein
+    # manuelles Signup pro Spieler nötig (siehe Chat-Verlauf).
     #
-    # Zwei Wege, ein Roster zu aktualisieren:
-    #   /tw_register    -- pro Spieler, einmalig bei Registrierung, danach bei
-    #                       Bedarf erneut aufrufbar (aktualisiert denselben
-    #                       Datensatz statt einen zweiten anzulegen).
-    #   refresh_rosters_task -- automatisch, nächtlich, für ALLE registrierten
-    #                       Spieler (analog zu refresh_characters_task).
-    #   /tw_roster_refresh -- manuell, für ALLE registrierten Spieler, für den
-    #                       Fall "TW startet gleich, wer hat sich seit Tagen
-    #                       nicht aktualisiert" -- nicht auf den nächtlichen
-    #                       Task warten wollen. Manager-Rechte, da es echte
-    #                       Netzwerklast auf der eigenen comlink-Instanz
-    #                       erzeugt (ein Call pro registriertem Spieler), kein
-    #                       Selbstbedienungs-Command wie /tw_register.
+    # /tw_register bleibt bestehen, aber mit anderer Rolle als vorher: es
+    # verknüpft nur noch die Discord-ID eines Spielers mit seinem (ohnehin
+    # schon bekannten) Ally-Code -- für eine spätere mitgliederliste=True-
+    # Auswertung in /tw_zone_attack, die konkrete Discord-Nutzer nennen
+    # will, nicht nur Ally-Codes. Es ist NICHT mehr die einzige Quelle für
+    # Rosterdaten, nur noch für die Discord-Verknüpfung.
+    #
+    # Drei Wege, ein Roster zu aktualisieren:
+    #   /tw_register       -- pro Spieler, verknüpft Discord-ID + lädt sein
+    #                          Roster sofort zur Bestätigung (unabhängig
+    #                          vom nächtlichen Task).
+    #   refresh_rosters_task -- automatisch, nächtlich, für die GESAMTE
+    #                          hinterlegte Gilde.
+    #   /tw_roster_refresh  -- manuell, für die GESAMTE Gilde, für den Fall
+    #                          "TW startet gleich, nicht auf den
+    #                          nächtlichen Task warten wollen". Manager-
+    #                          Rechte, da es echte Netzwerklast auf der
+    #                          eigenen comlink-Instanz erzeugt (ein Call
+    #                          pro Gildenmitglied), kein Selbstbedienungs-
+    #                          Command wie /tw_register.
 
+    @tree.command(
+        name="tw_guild_set",
+        description="Hinterlegt die SWGOH-Gilden-ID über einen bekannten Ally-Code (Manager/Admin)",
+    )
+    @app_commands.describe(
+        ally_code="Ally-Code eines beliebigen Gildenmitglieds (z.B. dein eigener)"
+    )
+    async def tw_guild_set(interaction: discord.Interaction, ally_code: str):
+        if not is_manager(interaction):
+            await interaction.response.send_message(
+                "Dieser Befehl erfordert Administrator-Rechte oder Manager-Status.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            normalized = roster.normalize_ally_code(ally_code)
+        except ValueError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            guild_id, guild_name = await roster.resolve_guild_id(normalized)
+        except roster.AllyCodeNotFoundError as e:
+            await interaction.followup.send(str(e))
+            return
+        except roster.RosterFetchError:
+            logger.exception(
+                "Guild-ID-Auflösung über Ally-Code %s fehlgeschlagen.", normalized
+            )
+            await interaction.followup.send(
+                "Comlink war gerade nicht erreichbar. Bitte später erneut versuchen."
+            )
+            return
+
+        db.set_swgoh_guild(guild_id, guild_name)
+        await interaction.followup.send(
+            f"SWGOH-Gilde hinterlegt: **{guild_name or guild_id}**. Der nächste "
+            f"Roster-Refresh lädt jetzt die gesamte Gilde, kein einzelnes "
+            f"`/tw_register` pro Spieler mehr nötig."
+        )
 
     @tree.command(
         name="tw_register",
-        description="Registriert deinen Ally-Code und lädt dein aktuelles Roster",
+        description="Verknüpft deinen Discord-Account mit deinem (bereits bekannten) Ally-Code",
     )
     @app_commands.describe(ally_code="Dein Ally-Code, z.B. 123456789 oder 123-456-789")
     async def tw_register(interaction: discord.Interaction, ally_code: str):
@@ -757,17 +816,18 @@ if ROSTER_FEATURE_ENABLED:
             )
             return
 
-        db.register_player(str(interaction.user.id), normalized)
-        db.save_roster(str(interaction.user.id), player_name, units)
+        db.upsert_player(normalized, player_name)
+        db.save_roster(normalized, player_name, units)
+        db.link_discord_id(normalized, str(interaction.user.id))
 
         await interaction.followup.send(
-            f"Registriert als **{player_name}** ({normalized}) — {len(units)} Einheiten geladen."
+            f"Verknüpft mit **{player_name}** ({normalized}) — {len(units)} Einheiten geladen. "
+            f"Dein Roster wird ab jetzt auch beim nächtlichen Gilden-Refresh automatisch aktualisiert."
         )
-
 
     @tree.command(
         name="tw_roster_refresh",
-        description="Aktualisiert die Rosterdaten aller registrierten Spieler sofort (Manager/Admin)",
+        description="Aktualisiert die Rosterdaten der gesamten Gilde sofort (Manager/Admin)",
     )
     async def tw_roster_refresh(interaction: discord.Interaction):
         if not is_manager(interaction):
@@ -777,60 +837,74 @@ if ROSTER_FEATURE_ENABLED:
             )
             return
 
-        players = db.get_all_registered_players()
-        if not players:
+        if db.get_swgoh_guild() is None:
             await interaction.response.send_message(
-                "Keine registrierten Spieler.", ephemeral=True
+                "Keine SWGOH-Gilden-ID hinterlegt. Erst `/tw_guild_set` nutzen.",
+                ephemeral=True,
             )
             return
 
         await interaction.response.defer(ephemeral=True)
-        updated, failed = await _refresh_all_rosters(players)
+        updated, failed = await _refresh_guild_rosters()
 
         await interaction.followup.send(
             f"Roster-Refresh abgeschlossen: {updated} aktualisiert, {failed} fehlgeschlagen."
         )
 
+    async def _refresh_guild_rosters() -> tuple[int, int]:
+        """
+        Zieht die komplette Mitgliederliste der hinterlegten SWGOH-Gilde
+        über comlink (roster.fetch_guild_members()) und aktualisiert JEDEN
+        gefundenen Spieler -- nicht mehr beschränkt auf die, die zufällig
+        /tw_register genutzt haben.
 
-    async def _refresh_all_rosters(players: list) -> tuple[int, int]:
+        Sequentiell statt parallel (asyncio.gather): das ist die selbst
+        gehostete comlink-Instanz, absichtlich kein Ansturm aus N
+        gleichzeitigen Requests gegen das eigentliche Spiel-Backend
+        dahinter (Capital Games limitiert öffentlich ohnehin auf wenige
+        Dutzend Requests/Sekunde pro IP). Ein einzelner fehlgeschlagener
+        Spieler bricht den Rest des Durchlaufs nicht ab.
+
+        Gibt (0, 0) zurück, wenn keine Gilden-ID hinterlegt ist ODER die
+        Mitgliederliste nicht geladen werden konnte -- kein Fehler in
+        diesem Fall, der Aufrufer entscheidet, ob/wie das gemeldet wird.
         """
-        Gemeinsame Refresh-Schleife für /tw_roster_refresh und
-        refresh_rosters_task. Sequentiell statt parallel (asyncio.gather) --
-        das ist die selbst gehostete comlink-Instanz, absichtlich kein
-        Ansturm aus N gleichzeitigen Requests gegen das eigentliche Spiel-
-        Backend dahinter. Ein einzelner fehlgeschlagener Spieler bricht den
-        Rest des Durchlaufs nicht ab.
-        """
+        guild_row = db.get_swgoh_guild()
+        if guild_row is None:
+            return 0, 0
+
+        try:
+            members = await roster.fetch_guild_members(guild_row["guild_id"])
+        except (roster.AllyCodeNotFoundError, roster.RosterFetchError) as e:
+            logger.warning("Gilden-Mitgliederliste konnte nicht geladen werden: %s", e)
+            return 0, 0
+
         updated = 0
         failed = 0
-        for row in players:
+        for member in members:
+            ally_code = member["ally_code"]
             try:
-                player_name, units = await roster.fetch_roster(row["ally_code"])
-                db.save_roster(row["discord_id"], player_name, units)
+                player_name, units = await roster.fetch_roster(ally_code)
+                db.upsert_player(ally_code, player_name)
+                db.save_roster(ally_code, player_name, units)
                 updated += 1
             except (roster.AllyCodeNotFoundError, roster.RosterFetchError) as e:
                 logger.warning(
-                    "Roster-Refresh für discord_id=%s (Ally-Code %s) fehlgeschlagen: %s",
-                    row["discord_id"],
-                    row["ally_code"],
-                    e,
+                    "Roster-Refresh für Ally-Code %s fehlgeschlagen: %s", ally_code, e
                 )
                 failed += 1
         return updated, failed
 
-
     @tasks.loop(hours=24)
     async def refresh_rosters_task():
-        players = db.get_all_registered_players()
-        if not players:
-            return
-        updated, failed = await _refresh_all_rosters(players)
+        updated, failed = await _refresh_guild_rosters()
+        if updated == 0 and failed == 0:
+            return  # keine Gilden-ID hinterlegt -- kein Log-Rauschen jede Nacht
         logger.info(
-            "Nächtlicher Roster-Refresh abgeschlossen: %d aktualisiert, %d fehlgeschlagen.",
+            "Nächtlicher Gilden-Roster-Refresh abgeschlossen: %d aktualisiert, %d fehlgeschlagen.",
             updated,
             failed,
         )
-
 
     @refresh_rosters_task.before_loop
     async def before_refresh_rosters_task():
@@ -1174,20 +1248,28 @@ async def tw_help(interaction: discord.Interaction):
         "≤ -3 unterlegen, -2..+2 ausgeglichen, ≥ +3 überlegen.",
     ]
 
-    # /tw_register und /tw_roster_refresh nur auflisten, wenn sie auch
-    # tatsächlich bei Discord registriert sind (siehe ROSTER_FEATURE_ENABLED
-    # oben) -- sonst würde /tw_help Befehle bewerben, die gar nicht
-    # existieren.
+    # /tw_guild_set, /tw_register und /tw_roster_refresh nur auflisten,
+    # wenn sie auch tatsächlich bei Discord registriert sind (siehe
+    # ROSTER_FEATURE_ENABLED oben) -- sonst würde /tw_help Befehle
+    # bewerben, die gar nicht existieren.
     if ROSTER_FEATURE_ENABLED:
         sections.insert(
             6,
-            "**`/tw_register ally_code`** — *Mitglieder-Rolle*\n"
-            "Registriert deinen Ally-Code und lädt dein aktuelles Roster aus dem Spiel.",
+            "**`/tw_guild_set ally_code`** — *Manager/Admin*\n"
+            "Hinterlegt die SWGOH-Gilden-ID einmalig über einen bekannten Ally-Code. "
+            "Danach lädt der Roster-Refresh automatisch die gesamte Gilde.",
         )
         sections.insert(
             7,
+            "**`/tw_register ally_code`** — *Mitglieder-Rolle*\n"
+            "Verknüpft deinen Discord-Account mit deinem (bereits bekannten) Ally-Code -- "
+            "kein manuelles Signup nötig, damit dein Roster erfasst wird, nur um ihn dir "
+            "als Discord-Nutzer zuzuordnen.",
+        )
+        sections.insert(
+            8,
             "**`/tw_roster_refresh`** — *Manager/Admin*\n"
-            "Aktualisiert die Rosterdaten aller registrierten Spieler sofort, statt auf den "
+            "Aktualisiert die Rosterdaten der gesamten Gilde sofort, statt auf den "
             "nächtlichen automatischen Refresh zu warten.",
         )
 
