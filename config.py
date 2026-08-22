@@ -46,6 +46,15 @@ BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Vienna")
 # hat.
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
+# Für roster.py (/tw_register, Roster-Refresh). Zeigt auf die selbst
+# gehostete swgoh-comlink-Instanz (siehe docker-compose.yml, Service
+# `comlink`) -- im Compose-Netzwerk über den Service-Namen erreichbar,
+# lokal (Bot außerhalb Docker) auf http://localhost:<comlink-Port>.
+# Kein os.getenv-Crash beim Fehlen, aus demselben Grund wie
+# ANTHROPIC_API_KEY: der Fehler soll erst beim ersten tatsächlichen
+# /tw_register-Aufruf sichtbar werden, nicht schon beim Bot-Start.
+COMLINK_URL = os.getenv("COMLINK_URL", "http://localhost:3000")
+
 DB_PATH = os.path.join(DATA_DIR, "counters.db")
 
 # Relic-Eingabevalidierung (/tw_report). Fängt Tippfehler (z. B. "90") ab,

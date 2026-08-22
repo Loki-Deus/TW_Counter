@@ -8,6 +8,8 @@ services:
     image: tw-counter:latest
     container_name: tw-counter
     restart: unless-stopped
+    depends_on:
+      - comlink
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - GUILD_ID=${GUILD_ID}
@@ -18,8 +20,22 @@ services:
       - DATA_DIR=/app/data
       - BOT_TIMEZONE=${BOT_TIMEZONE:-Europe/Vienna}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # comlink ist im selben Compose-Netzwerk über den Service-Namen
+      # erreichbar -- hartkodiert wie DATA_DIR oben, nicht per .env
+      # überschreibbar, muss zum Service-Namen unten passen bleiben.
+      - COMLINK_URL=http://comlink:3000
     volumes:
       - tw-counter-data:/app/data
+
+  # Selbst gehostete swgoh-comlink-Instanz (siehe roster.py) -- kein
+  # Port-Mapping nach außen, nur tw-counter im internen Compose-Netzwerk
+  # muss diesen Dienst erreichen können.
+  comlink:
+    image: ghcr.io/swgoh-utils/swgoh-comlink:latest
+    container_name: tw-counter-comlink
+    restart: unless-stopped
+    environment:
+      - APP_NAME=${COMLINK_APP_NAME:-tw-counter-bot}
 
 volumes:
   tw-counter-data:

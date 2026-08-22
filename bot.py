@@ -1,10 +1,12 @@
 """
 TW-Counter-Bot — Discord-Bot für SWGOH-Territory-War-Konter.
 Verdrahtet config.py (Env/Konstanten), db.py (Event-Log-Modell),
-character_list.py (Autocomplete-Datenquelle) und smartbot.py
+character_list.py (Autocomplete-Datenquelle), roster.py (Ally-Code-Roster
+über eine selbst gehostete comlink-Instanz) und smartbot.py
 (natürlichsprachlicher Query-Layer über Claude) zu den Slash-Commands
-/tw_add, /tw_report, /tw_lookup, /tw_ask, /tw_delete, /tw_characterrefresh,
-/tw_celebrate, /tw_help.
+/tw_add, /tw_report, /tw_lookup, /tw_zone_add, /tw_zone_attack,
+/tw_register, /tw_roster_refresh, /tw_ask, /tw_delete,
+/tw_characterrefresh, /tw_celebrate, /tw_help.
 
 Bewusst keine feste Anzahl mehr genannt (frühere Version sagte "fünf" und
 lief der tatsächlichen Command-Liste zweimal in Folge hinterher) -- bei der
@@ -12,8 +14,14 @@ nächsten Erweiterung reicht es, den Namen oben in die Liste einzufügen,
 ohne eine Zahl mitpflegen zu müssen.
 
 Berechtigungsmodell: zwei unabhängige Rollen ohne Administrator-Override.
-SPECIALIST_ROLE_ID gate für /tw_add, MEMBER_ROLE_ID für /tw_report.
-/tw_delete erfordert Administrator ODER Mitgliedschaft in MANAGER_IDS.
+SPECIALIST_ROLE_ID gate für /tw_add und /tw_zone_add (Katalogpflege),
+MEMBER_ROLE_ID für /tw_report und /tw_register (beides Selbstbedienung
+für Mitglieder). /tw_delete, /tw_zone_attack und /tw_roster_refresh
+erfordern Administrator ODER Mitgliedschaft in MANAGER_IDS --
+/tw_zone_attack, weil es eine taktische Kriegsnacht-Entscheidung ist statt
+Katalogpflege; /tw_roster_refresh, weil es echte Netzwerklast auf der
+eigenen comlink-Instanz erzeugt und kein Selbstbedienungs-Command wie
+/tw_register ist.
 /tw_lookup, /tw_ask, /tw_celebrate und /tw_help sind für alle offen.
 
 Natürlichsprachliche Anfragen laufen über zwei Trigger auf denselben
@@ -27,6 +35,7 @@ funktioniert, wenn das Feld beim Ausfüllen bereits gesetzt ist.
 """
 
 import logging
+from collections import Counter
 
 import discord
 from discord import app_commands
@@ -36,6 +45,7 @@ from discord.ext.commands import Bot
 import config
 import db
 import character_list
+import roster
 import smartbot
 
 logging.basicConfig(
@@ -146,6 +156,18 @@ async def attacker_for_defender_autocomplete(
     ]
 
 
+async def zone_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Zonen-Katalog für /tw_zone_add und /tw_zone_attack. Direkt aus der DB
+    gelesen statt aus einem In-Memory-Cache wie character_names — siehe
+    Begründung bei db.get_zone_names()."""
+    return [
+        app_commands.Choice(name=n, value=n)
+        for n in filter_autocomplete(current, db.get_zone_names())
+    ]
+
+
 # ── Lookup-Formatierung ───────────────────────────────────────────────────
 
 BUCKET_ORDER = ("under", "even", "over")
@@ -153,8 +175,90 @@ BUCKET_LABELS = {"under": "Unterlegen", "even": "Ausgeglichen", "over": "Überle
 _DISCORD_MESSAGE_LIMIT = 1900  # Sicherheitsabstand zum harten 2000-Zeichen-Limit
 
 
+def _aggregate_bucket_stats(attackers: list[str], bucket_rows: list) -> dict:
+    """
+    {attacker: {bucket: {"wins", "losses"}}} für alle `attackers`, befüllt
+    aus `bucket_rows` (db.get_bucket_stats() — INNER JOIN, lässt reportlose
+    Konter aus). Attacker ohne Zeile in bucket_rows bleiben bei 0/0 statt zu
+    fehlen — Grundlage sowohl für die /tw_lookup-Tabelle als auch für
+    rank_attackers() (siehe dort).
+    """
+    stats = {a: {b: {"wins": 0, "losses": 0} for b in BUCKET_ORDER} for a in attackers}
+    for row in bucket_rows:
+        attacker = row["attacking_leader"]
+        bucket = row["bucket"]
+        if attacker in stats and bucket in stats[attacker]:
+            stats[attacker][bucket]["wins"] = row["wins"] or 0
+            stats[attacker][bucket]["losses"] = row["losses"] or 0
+    return stats
+
+
+def _even_sort_key(attacker: str, stats: dict) -> tuple[bool, float]:
+    """Ausgeglichen-Quote als Sortierschlüssel; Konter ohne Daten in diesem
+    Bucket sinken ans Ende (siehe Aufrufer für die Sortierrichtung)."""
+    wins = stats[attacker]["even"]["wins"]
+    losses = stats[attacker]["even"]["losses"]
+    total = wins + losses
+    return (total > 0, (wins / total) if total > 0 else 0.0)
+
+
+def _aggregate_banner_stats(banner_rows: list) -> dict:
+    """{attacker: {"avg", "count"}} aus db.get_banner_stats() -- getrennt
+    von _aggregate_bucket_stats(), weil Banner nicht pro Bucket vorliegt,
+    sondern als eigene vierte Spalte (siehe get_banner_stats()-Docstring).
+    Attacker ohne jede Banner-Angabe fehlen hier komplett statt mit 0
+    aufzutauchen -- der Aufrufer muss das als "keine Angabe" behandeln,
+    nicht als "0 Banner"."""
+    return {
+        row["attacking_leader"]: {"avg": row["avg_banners"], "count": row["banner_count"]}
+        for row in banner_rows
+    }
+
+
+def rank_attackers(defending_leader: str) -> list[dict]:
+    """
+    Gemeinsame Ranking-Grundlage für /tw_lookup UND /tw_zone_attack: alle
+    bekannten Angreifer gegen defending_leader, sortiert nach
+    Ausgeglichen-Quote absteigend (identische Sortierlogik wie bisher in
+    format_lookup_table, hier herausgezogen statt ein zweites Mal in dieser
+    Datei dupliziert -- smartbot.py dupliziert dieselbe Aggregation separat
+    aus Zirkelimport-Gründen, siehe dortiger Kommentar; das gilt hier nicht,
+    beide Aufrufer leben in bot.py).
+
+    Gibt [] zurück, wenn kein Konter gegen defending_leader existiert.
+    Jeder Eintrag: {"attacker": str, "buckets": {...}, "banner": {"avg", "count"}}.
+    banner fehlt nie als Schlüssel, ist aber {"avg": None, "count": 0}, wenn
+    keine Banner-Angabe vorliegt -- Aufrufer müssen nicht extra auf Existenz
+    des Schlüssels prüfen, nur auf count.
+    """
+    attackers = db.get_attackers_for_defender(defending_leader)
+    if not attackers:
+        return []
+
+    bucket_rows = db.get_bucket_stats(defending_leader)
+    stats = _aggregate_bucket_stats(attackers, bucket_rows)
+    banner_stats = _aggregate_banner_stats(db.get_banner_stats(defending_leader))
+
+    ordered = sorted(
+        attackers,
+        key=lambda a: (
+            not _even_sort_key(a, stats)[0],
+            -_even_sort_key(a, stats)[1],
+            a,
+        ),
+    )
+    return [
+        {
+            "attacker": a,
+            "buckets": stats[a],
+            "banner": banner_stats.get(a, {"avg": None, "count": 0}),
+        }
+        for a in ordered
+    ]
+
+
 def format_lookup_table(
-    defending_leader: str, attackers: list[str], bucket_rows: list
+    defending_leader: str, attackers: list[str], bucket_rows: list, banner_rows: list
 ) -> list[str]:
     """
     Baut die /tw_lookup-Ausgabe. Reine Funktion ohne discord.Interaction-
@@ -166,27 +270,25 @@ def format_lookup_table(
                db.get_bucket_stats(). Der INNER JOIN dort lässt reportlose
                Konter aus; hier werden sie über `attackers` ergänzt und als
                "keine Berichte" ausgegeben.
+    banner_rows: aus db.get_banner_stats() -- Angreifer ohne jede
+               Banner-Angabe fehlen darin, werden hier als leere vierte
+               Spalte dargestellt, nicht als 0.
 
     Primärsortierung: ausgeglichen-Quote absteigend; Konter ohne
-    ausgeglichen-Daten sinken ans Ende.
+    ausgeglichen-Daten sinken ans Ende. Banner fließt bewusst NICHT in die
+    Sortierung ein -- es ist ein optionales Zusatzfeld, keine Ranking-Basis
+    (Stakeholder-Vorgabe: rein informativ als vierte Spalte).
     """
-    stats = {a: {b: {"wins": 0, "losses": 0} for b in BUCKET_ORDER} for a in attackers}
-    for row in bucket_rows:
-        attacker = row["attacking_leader"]
-        bucket = row["bucket"]
-        if attacker in stats and bucket in stats[attacker]:
-            stats[attacker][bucket]["wins"] = row["wins"] or 0
-            stats[attacker][bucket]["losses"] = row["losses"] or 0
-
-    def even_sort_key(attacker: str) -> tuple[bool, float]:
-        wins = stats[attacker]["even"]["wins"]
-        losses = stats[attacker]["even"]["losses"]
-        total = wins + losses
-        return (total > 0, (wins / total) if total > 0 else 0.0)
+    stats = _aggregate_bucket_stats(attackers, bucket_rows)
+    banner_stats = _aggregate_banner_stats(banner_rows)
 
     ordered = sorted(
         attackers,
-        key=lambda a: (not even_sort_key(a)[0], -even_sort_key(a)[1], a),
+        key=lambda a: (
+            not _even_sort_key(a, stats)[0],
+            -_even_sort_key(a, stats)[1],
+            a,
+        ),
     )
 
     def cell(attacker: str, bucket: str) -> str:
@@ -198,19 +300,27 @@ def format_lookup_table(
         pct = round((wins / total) * 100)
         return f"{pct}% ({wins}/{losses})"
 
-    col_attacker, col_bucket = 28, 16
+    def banner_cell(attacker: str) -> str:
+        b = banner_stats.get(attacker)
+        if not b or not b["count"]:
+            return ""
+        return f"{b['avg']:.1f} (n={b['count']})"
+
+    col_attacker, col_bucket, col_banner = 28, 16, 14
     header_line = (
         f"{'Angreifer':<{col_attacker}} "
         f"{BUCKET_LABELS['under']:<{col_bucket}} "
         f"{BUCKET_LABELS['even']:<{col_bucket}} "
-        f"{BUCKET_LABELS['over']:<{col_bucket}}"
+        f"{BUCKET_LABELS['over']:<{col_bucket}} "
+        f"{'Banner':<{col_banner}}"
     )
-    separator_line = "-" * (col_attacker + 3 * col_bucket + 3)
+    separator_line = "-" * (col_attacker + 3 * col_bucket + col_banner + 4)
     body_lines = [
         f"{a:<{col_attacker}} "
         f"{cell(a, 'under'):<{col_bucket}} "
         f"{cell(a, 'even'):<{col_bucket}} "
-        f"{cell(a, 'over'):<{col_bucket}}"
+        f"{cell(a, 'over'):<{col_bucket}} "
+        f"{banner_cell(a):<{col_banner}}"
         for a in ordered
     ]
 
@@ -292,6 +402,7 @@ tw_add.autocomplete("verteidiger")(character_autocomplete)
     angreifer="Angreifender Anführer",
     angreifer_relic="Relic-Level des Angreifer-Anführers (0-20)",
     ergebnis="Sieg oder Niederlage",
+    banner="Erzielte Banner (optional bei Sieg; bei Niederlage automatisch 0)",
 )
 @app_commands.choices(
     ergebnis=[
@@ -306,6 +417,7 @@ async def tw_report(
     angreifer: str,
     angreifer_relic: app_commands.Range[int, config.MIN_RELIC, config.MAX_RELIC],
     ergebnis: app_commands.Choice[int],
+    banner: int | None = None,
 ):
     if not is_member(interaction):
         await interaction.response.send_message(
@@ -313,6 +425,24 @@ async def tw_report(
             ephemeral=True,
         )
         return
+
+    if banner is not None and banner < 0:
+        await interaction.response.send_message(
+            "Banner darf nicht negativ sein.", ephemeral=True
+        )
+        return
+
+    # Eine Niederlage bringt in SWGOH TW keine Banner -- das ist eine feste
+    # Spielregel, kein Schätzwert, also hier erzwungen statt dem manuellen
+    # Reporting überlassen. Discord kann das banner-Feld nicht abhängig vom
+    # gewählten ergebnis aus-/einblenden, das Feld bleibt also immer
+    # sichtbar -- ein hier trotzdem eingetragener Wert wird bei einer
+    # Niederlage überschrieben, nicht stillschweigend verworfen: die
+    # Bestätigungsnachricht unten weist explizit darauf hin, damit niemand
+    # rätselt, warum der gemeldete Wert vom gespeicherten abweicht.
+    banner_overridden = ergebnis.value == 0 and banner is not None and banner != 0
+    if ergebnis.value == 0:
+        banner = 0
 
     # app_commands.Range erzwingt MIN_RELIC..MAX_RELIC bereits clientseitig
     # (Discord zeigt ein Zahlenfeld mit diesen Grenzen) und serverseitig beim
@@ -325,6 +455,7 @@ async def tw_report(
             verteidiger_relic,
             ergebnis.value,
             str(interaction.user.id),
+            banners=banner,
         )
     except db.CounterNotFoundError:
         await interaction.response.send_message(
@@ -336,9 +467,15 @@ async def tw_report(
 
     delta = angreifer_relic - verteidiger_relic
     bucket_label = BUCKET_LABELS[config.bucket_for_delta(delta)]
+    if banner_overridden:
+        banner_suffix = ", Banner: 0 (Niederlage — eingegebener Wert wurde überschrieben)"
+    elif banner is not None:
+        banner_suffix = f", Banner: {banner}"
+    else:
+        banner_suffix = ""
     await interaction.response.send_message(
         f"Report gespeichert: **{angreifer}** ({angreifer_relic}) vs **{verteidiger}** ({verteidiger_relic}) "
-        f"→ {ergebnis.name}, Bucket **{bucket_label}** (Δ{delta:+d}).",
+        f"→ {ergebnis.name}, Bucket **{bucket_label}** (Δ{delta:+d}){banner_suffix}.",
         ephemeral=True,
     )
 
@@ -363,7 +500,8 @@ async def tw_lookup(interaction: discord.Interaction, verteidiger: str):
         return
 
     bucket_rows = db.get_bucket_stats(verteidiger)
-    messages = format_lookup_table(verteidiger, attackers, bucket_rows)
+    banner_rows = db.get_banner_stats(verteidiger)
+    messages = format_lookup_table(verteidiger, attackers, bucket_rows, banner_rows)
 
     await interaction.response.send_message(messages[0])
     for extra in messages[1:]:
@@ -371,6 +509,308 @@ async def tw_lookup(interaction: discord.Interaction, verteidiger: str):
 
 
 tw_lookup.autocomplete("verteidiger")(character_autocomplete)
+
+
+# ── /tw_zone_add ──────────────────────────────────────────────────────────
+# Zonen sind Kartengeometrie, kein Match-Ergebnis -- selbe Berechtigungs-
+# Kategorie wie /tw_add (Katalog kuratieren), nicht wie /tw_report.
+
+
+@tree.command(
+    name="tw_zone_add",
+    description="Legt eine TW-Zone an (nur TW-Spezialisten)",
+)
+@app_commands.describe(
+    name="Name der Zone, z.B. 'Territorium 3 – Zone B'",
+    bild_url="Optionale Bild-URL zur Zone (Kartenausschnitt o.ä.)",
+)
+async def tw_zone_add(
+    interaction: discord.Interaction, name: str, bild_url: str | None = None
+):
+    if not is_tw_specialist(interaction):
+        await interaction.response.send_message(
+            "Dieser Befehl ist auf die Rolle TW-Spezialisten beschränkt.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        db.add_zone(name, bild_url)
+    except db.ZoneExistsError:
+        await interaction.response.send_message(
+            f"Zone **{name}** existiert bereits.", ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"Zone **{name}** angelegt.", ephemeral=True
+    )
+
+
+# ── /tw_zone_attack ───────────────────────────────────────────────────────
+# Offiziers-Werkzeug für den TW-Abend: bis zu drei mögliche Verteidiger für
+# eine Zone (Unsicherheit beim Scouten -- der Angreifer weiß oft nicht mit
+# letzter Sicherheit, welcher Anführer tatsächlich dahintersteckt), liefert
+# pro Verteidiger die Top-Angreifer aus dem bestehenden Konter-Katalog
+# (rank_attackers(), s.o.) sowie eine Hedge-Zeile für Angreifer, die bei
+# mehr als einem der genannten Verteidiger unter den Top-Treffern liegen --
+# die lohnen sich zuerst zuzuteilen, wenn die Scouting-Lage unsicher ist.
+#
+# Gate: is_manager(), nicht is_tw_specialist() -- das hier ist eine
+# taktische Kriegsnacht-Entscheidung (Offiziers-Ebene), keine
+# Katalogpflege wie /tw_add/tw_zone_add.
+#
+# `mitgliederliste` ist bewusst vom Grundaufruf getrennt: die Empfehlung
+# selbst kommt komplett aus counters/reports, ohne zusätzlichen Datenpfad.
+# Welche Mitglieder die empfohlenen Angreifer-Anführer tatsächlich besitzen,
+# bräuchte eine Roster-Quelle (Ally-Code -> Einheitenbesitz), die es aktuell
+# nicht gibt -- der Parameter ist hier bereits als Schnittstelle angelegt,
+# liefert aber einen expliziten Hinweis statt erfundener Namen, bis diese
+# Datenquelle existiert.
+
+_ZONE_TOP_N = 3
+
+
+def format_zone_attack(
+    zone_name: str,
+    zone_image_url: str | None,
+    verteidiger_liste: list[str],
+    mitgliederliste: bool,
+) -> str:
+    """Reine Funktion ohne discord.Interaction-Abhängigkeit, wie format_lookup_table."""
+    lines = [f"## Zonen-Angriff: {zone_name}"]
+    if zone_image_url:
+        lines.append(zone_image_url)  # Discord rendert eine alleinstehende Bild-URL als Vorschau
+    lines.append("")
+
+    per_defender_top: dict[str, list[str]] = {}
+
+    for verteidiger in verteidiger_liste:
+        ranked = rank_attackers(verteidiger)
+        lines.append(f"**Gegen {verteidiger}:**")
+
+        if not ranked:
+            lines.append("Keine Konter hinterlegt.")
+            per_defender_top[verteidiger] = []
+            lines.append("")
+            continue
+
+        top = ranked[:_ZONE_TOP_N]
+        per_defender_top[verteidiger] = [r["attacker"] for r in top]
+
+        for r in top:
+            even = r["buckets"]["even"]
+            total = even["wins"] + even["losses"]
+            if total == 0:
+                lines.append(f"- {r['attacker']} — keine Berichte im ausgeglichenen Bucket")
+            else:
+                pct = round((even["wins"] / total) * 100)
+                lines.append(
+                    f"- {r['attacker']} — {pct}% ({even['wins']}/{even['losses']}) ausgeglichen"
+                )
+        lines.append("")
+
+    if len(verteidiger_liste) > 1:
+        counts = Counter(
+            attacker for tops in per_defender_top.values() for attacker in tops
+        )
+        hedges = sorted(a for a, c in counts.items() if c > 1)
+        if hedges:
+            lines.append(
+                f"**Hedge (deckt mehrere der genannten Verteidiger ab):** {', '.join(hedges)}"
+            )
+            lines.append("")
+
+    if mitgliederliste:
+        lines.append(
+            "-# Mitgliederliste noch nicht verfügbar — dafür fehlt aktuell eine "
+            "Roster-Datenquelle. Diese Empfehlung zeigt nur, welche Anführer aus "
+            "dem Konter-Katalog in Frage kommen, nicht, wer sie im Kader hat."
+        )
+
+    return "\n".join(lines)
+
+
+@tree.command(
+    name="tw_zone_attack",
+    description="Empfiehlt Angreifer für eine Zone anhand bis zu drei möglicher Verteidiger",
+)
+@app_commands.describe(
+    zone="TW-Zone",
+    verteidiger_1="Erster möglicher Verteidiger-Anführer",
+    verteidiger_2="Zweiter möglicher Verteidiger-Anführer (optional)",
+    verteidiger_3="Dritter möglicher Verteidiger-Anführer (optional)",
+    mitgliederliste="Zusätzlich Mitglieder auflisten, die die empfohlenen Konter besetzen können",
+)
+async def tw_zone_attack(
+    interaction: discord.Interaction,
+    zone: str,
+    verteidiger_1: str,
+    verteidiger_2: str | None = None,
+    verteidiger_3: str | None = None,
+    mitgliederliste: bool = False,
+):
+    if not is_manager(interaction):
+        await interaction.response.send_message(
+            "Dieser Befehl erfordert Administrator-Rechte oder Manager-Status.",
+            ephemeral=True,
+        )
+        return
+
+    zone_row = db.get_zone(zone)
+    if zone_row is None:
+        await interaction.response.send_message(
+            f"Zone **{zone}** ist nicht hinterlegt. Nutze `/tw_zone_add`, um sie anzulegen.",
+            ephemeral=True,
+        )
+        return
+
+    verteidiger_liste = [v for v in (verteidiger_1, verteidiger_2, verteidiger_3) if v]
+
+    text = format_zone_attack(
+        zone_row["name"], zone_row["image_url"], verteidiger_liste, mitgliederliste
+    )
+    await interaction.response.send_message(text)
+
+
+tw_zone_attack.autocomplete("zone")(zone_autocomplete)
+tw_zone_attack.autocomplete("verteidiger_1")(character_autocomplete)
+tw_zone_attack.autocomplete("verteidiger_2")(character_autocomplete)
+tw_zone_attack.autocomplete("verteidiger_3")(character_autocomplete)
+
+
+# ── /tw_register & Roster-Refresh ────────────────────────────────────────
+# Ally-Code-Registrierung (roster.py) -- Grundlage für eine spätere
+# mitgliederliste=True-Auswertung in /tw_zone_attack (aktuell noch nicht
+# verknüpft, siehe roster.py-Docstring: die Namensraum-Brücke
+# defId<->Anzeigename fehlt noch).
+#
+# Zwei Wege, ein Roster zu aktualisieren:
+#   /tw_register    -- pro Spieler, einmalig bei Registrierung, danach bei
+#                       Bedarf erneut aufrufbar (aktualisiert denselben
+#                       Datensatz statt einen zweiten anzulegen).
+#   refresh_rosters_task -- automatisch, nächtlich, für ALLE registrierten
+#                       Spieler (analog zu refresh_characters_task).
+#   /tw_roster_refresh -- manuell, für ALLE registrierten Spieler, für den
+#                       Fall "TW startet gleich, wer hat sich seit Tagen
+#                       nicht aktualisiert" -- nicht auf den nächtlichen
+#                       Task warten wollen. Manager-Rechte, da es echte
+#                       Netzwerklast auf der eigenen comlink-Instanz
+#                       erzeugt (ein Call pro registriertem Spieler), kein
+#                       Selbstbedienungs-Command wie /tw_register.
+
+
+@tree.command(
+    name="tw_register",
+    description="Registriert deinen Ally-Code und lädt dein aktuelles Roster",
+)
+@app_commands.describe(ally_code="Dein Ally-Code, z.B. 123456789 oder 123-456-789")
+async def tw_register(interaction: discord.Interaction, ally_code: str):
+    if not is_member(interaction):
+        await interaction.response.send_message(
+            "Dieser Befehl ist auf die Rolle der Report-berechtigten Mitglieder beschränkt.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        normalized = roster.normalize_ally_code(ally_code)
+    except ValueError as e:
+        await interaction.response.send_message(str(e), ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        player_name, units = await roster.fetch_roster(normalized)
+    except roster.AllyCodeNotFoundError as e:
+        await interaction.followup.send(str(e))
+        return
+    except roster.RosterFetchError:
+        logger.exception("Roster-Fetch für Ally-Code %s fehlgeschlagen.", normalized)
+        await interaction.followup.send(
+            "Comlink war gerade nicht erreichbar. Bitte später erneut versuchen."
+        )
+        return
+
+    db.register_player(str(interaction.user.id), normalized)
+    db.save_roster(str(interaction.user.id), player_name, units)
+
+    await interaction.followup.send(
+        f"Registriert als **{player_name}** ({normalized}) — {len(units)} Einheiten geladen."
+    )
+
+
+@tree.command(
+    name="tw_roster_refresh",
+    description="Aktualisiert die Rosterdaten aller registrierten Spieler sofort (Manager/Admin)",
+)
+async def tw_roster_refresh(interaction: discord.Interaction):
+    if not is_manager(interaction):
+        await interaction.response.send_message(
+            "Dieser Befehl erfordert Administrator-Rechte oder Manager-Status.",
+            ephemeral=True,
+        )
+        return
+
+    players = db.get_all_registered_players()
+    if not players:
+        await interaction.response.send_message(
+            "Keine registrierten Spieler.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    updated, failed = await _refresh_all_rosters(players)
+
+    await interaction.followup.send(
+        f"Roster-Refresh abgeschlossen: {updated} aktualisiert, {failed} fehlgeschlagen."
+    )
+
+
+async def _refresh_all_rosters(players: list) -> tuple[int, int]:
+    """
+    Gemeinsame Refresh-Schleife für /tw_roster_refresh und
+    refresh_rosters_task. Sequentiell statt parallel (asyncio.gather) --
+    das ist die selbst gehostete comlink-Instanz, absichtlich kein
+    Ansturm aus N gleichzeitigen Requests gegen das eigentliche Spiel-
+    Backend dahinter. Ein einzelner fehlgeschlagener Spieler bricht den
+    Rest des Durchlaufs nicht ab.
+    """
+    updated = 0
+    failed = 0
+    for row in players:
+        try:
+            player_name, units = await roster.fetch_roster(row["ally_code"])
+            db.save_roster(row["discord_id"], player_name, units)
+            updated += 1
+        except (roster.AllyCodeNotFoundError, roster.RosterFetchError) as e:
+            logger.warning(
+                "Roster-Refresh für discord_id=%s (Ally-Code %s) fehlgeschlagen: %s",
+                row["discord_id"],
+                row["ally_code"],
+                e,
+            )
+            failed += 1
+    return updated, failed
+
+
+@tasks.loop(hours=24)
+async def refresh_rosters_task():
+    players = db.get_all_registered_players()
+    if not players:
+        return
+    updated, failed = await _refresh_all_rosters(players)
+    logger.info(
+        "Nächtlicher Roster-Refresh abgeschlossen: %d aktualisiert, %d fehlgeschlagen.",
+        updated,
+        failed,
+    )
+
+
+@refresh_rosters_task.before_loop
+async def before_refresh_rosters_task():
+    await bot.wait_until_ready()
 
 
 # ── /tw_ask & @mention ──────────────────────────────────────────────────
@@ -671,10 +1111,24 @@ async def tw_help(interaction: discord.Interaction):
         "## TW-Counter Bot — Befehlsübersicht\n\n"
         "**`/tw_add verteidiger angreifer`** — *Spezialisten-Rolle*\n"
         "Legt einen leeren Konter an (kein Ergebnis, keine Relic-Werte).\n\n"
-        "**`/tw_report verteidiger verteidiger_relic angreifer angreifer_relic ergebnis`** — *Mitglieder-Rolle*\n"
-        "Meldet ein Kampfergebnis für einen bereits existierenden Konter.\n\n"
+        "**`/tw_report verteidiger verteidiger_relic angreifer angreifer_relic ergebnis banner`** — *Mitglieder-Rolle*\n"
+        "Meldet ein Kampfergebnis für einen bereits existierenden Konter. `banner` ist optional bei "
+        "Sieg; bei Niederlage wird er automatisch auf 0 gesetzt, ein trotzdem eingetragener Wert wird überschrieben.\n\n"
         "**`/tw_lookup verteidiger`** — *alle*\n"
-        "Zeigt alle Konter gegen einen Verteidiger, sortiert nach Ausgeglichen-Quote.\n\n"
+        "Zeigt alle Konter gegen einen Verteidiger, sortiert nach Ausgeglichen-Quote, "
+        "inklusive Durchschnitts-Banner als vierte Spalte (nur für Angreifer mit mindestens "
+        "einer Banner-Angabe).\n\n"
+        "**`/tw_zone_add name bild_url`** — *Spezialisten-Rolle*\n"
+        "Legt eine TW-Zone an (Kartenreferenz für `/tw_zone_attack`).\n\n"
+        "**`/tw_zone_attack zone verteidiger_1 verteidiger_2 verteidiger_3 mitgliederliste`** — *Manager/Admin*\n"
+        "Empfiehlt Angreifer für eine Zone anhand von bis zu drei möglichen Verteidigern, "
+        "inklusive Hedge-Hinweis bei mehrdeutiger Scouting-Lage. `mitgliederliste` ist als "
+        "Schnittstelle angelegt, liefert aber noch keine echten Mitgliedernamen (fehlende Namensraum-Brücke).\n\n"
+        "**`/tw_register ally_code`** — *Mitglieder-Rolle*\n"
+        "Registriert deinen Ally-Code und lädt dein aktuelles Roster aus dem Spiel.\n\n"
+        "**`/tw_roster_refresh`** — *Manager/Admin*\n"
+        "Aktualisiert die Rosterdaten aller registrierten Spieler sofort, statt auf den "
+        "nächtlichen automatischen Refresh zu warten.\n\n"
         "**`/tw_ask frage`** — *alle*\n"
         "Beantwortet eine Frage in natürlicher Sprache (Deutsch oder Englisch), "
         "z.B. 'was kontert Darth Vader?'. Alternativ: den Bot in einer normalen "
@@ -738,6 +1192,9 @@ async def on_ready():
 
     if not refresh_characters_task.is_running():
         refresh_characters_task.start()
+
+    if not refresh_rosters_task.is_running():
+        refresh_rosters_task.start()
 
     guild = discord.Object(id=config.GUILD_ID)
     tree.clear_commands(guild=guild)

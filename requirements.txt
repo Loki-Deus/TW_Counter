@@ -2,3 +2,8 @@ discord.py>=2.3.0
 python-dotenv>=1.0.0
 beautifulsoup4>=4.12.0
 anthropic>=0.40.0
+# Async-Client für die selbst gehostete comlink-Instanz (roster.py). Version
+# nach PyPI-Stand zum Zeitpunkt dieser Änderung -- vor dem Deploy prüfen, ob
+# eine neuere Version die in roster.py angenommene get_player()-Signatur
+# geändert hat.
+swgoh-comlink>=1.11.0
