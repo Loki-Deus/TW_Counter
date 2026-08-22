@@ -53,11 +53,13 @@ mehr (siehe dortiger Docstring).
 Speichert NUR normalisierte Werte (rarity, gear_tier, relic_tier,
 omicrons) in db.py, nicht den rohen Comlink-Response.
 
-WICHTIGE OFFENE LÜCKE, nicht Teil dieser Änderung: unit_id hier ist
-Comlinks defId (z.B. "DARTHVADER") -- ein anderer Namensraum als der
-Anzeigename aus character_list.py (z.B. "Darth Vader", geparst aus
-swgoh.gg-HTML) und wieder ein anderer als dessen dortiger URL-Slug. Es
-gibt aktuell KEINE Zuordnungstabelle zwischen diesen drei Namensräumen.
+WICHTIGE OFFENE LÜCKE, JETZT GESCHLOSSEN: unit_id hier ist Comlinks defId
+(z.B. "ZEBS3") -- früher ein anderer Namensraum als der Anzeigename aus
+character_list.py. fetch_unit_names() unten baut die Brücke über
+Comlinks eigene Game-Data + Lokalisierung, verifiziert gegen einen echten
+Response (ZEBS3 -> 'Garazeb "Zeb" Orrelios', siehe Chat-Verlauf). Bleibt
+offen: ob dieser Name Zeichen für Zeichen mit character_list.py's
+swgoh.gg-Scrape übereinstimmt -- siehe fetch_unit_names()-Docstring.
 Das bedeutet: die in db.py gespeicherten Rosterdaten lassen sich noch
 NICHT gegen counters.attacking_leader / defending_leader (Anzeigenamen)
 abgleichen -- also auch /tw_zone_attack mit mitgliederliste=True noch
@@ -69,6 +71,7 @@ Anzeigename mitliefert) ist ein eigener, noch offener Arbeitsschritt.
 import logging
 
 from swgoh_comlink import SwgohComlinkAsync
+from swgoh_comlink.helpers._data_items import DataItems
 
 import config
 
@@ -245,3 +248,82 @@ async def fetch_guild_members(guild_id: str) -> list[str]:
 
     members = guild_data.get("member", [])
     return [m["playerId"] for m in members if m.get("playerId")]
+
+
+async def fetch_unit_names(locale: str = "ENG_US") -> dict[str, str]:
+    """
+    Baut {unit_id: Anzeigename} für den gesamten Einheiten-Katalog --
+    Grundlage für die unit_names-Tabelle (siehe db.py), die
+    roster_units.unit_id (comlinks defId, z.B. "ZEBS3") auf einen
+    Anzeigenamen abbildet.
+
+    VERIFIZIERT gegen einen echten Response (siehe Chat-Verlauf): ZEBS3 ->
+    nameKey "UNIT_ZEBS3_NAME" -> aufgelöst zu 'Garazeb "Zeb" Orrelios'.
+    Zwei comlink-Aufrufe nötig, keine Abkürzung über GameDataBuilder (der
+    ist für StatCalc gedacht, nicht für Namensauflösung, siehe dessen
+    Quelltext):
+
+    1. get_game_data(items=DataItems.SEGMENT3) -- SEGMENT3 statt der
+       einzelnen DataItems.UNITS-Flagge: Comlink validiert `items` gegen
+       ein serverseitiges Enum und akzeptiert laut DataItems' eigenem
+       Docstring nur die SEGMENT1-4-Aggregate (und ALL), nicht rohe
+       Einzel-Flags -- ein einzelnes DataItems.UNITS würde vermutlich mit
+       HTTP 400 abgelehnt. SEGMENT3 enthält UNITS + RELIC_TIER_DEFINITION.
+    2. get_localization(locale=..., unzip=True) -- liefert KEIN
+       JSON-Dict von Schlüssel zu Text, sondern eine einzige, sehr große
+       (~12,5 MB im Test) pipe-getrennte Textdatei unter dem Schlüssel
+       "Loc_<LOCALE>.txt" ("SCHLÜSSEL|Text" pro Zeile, Kommentarzeilen mit
+       "#"), die hier manuell geparst wird.
+
+    locale bewusst ENG_US, NICHT Deutsch: character_list.py's bestehende
+    Anzeigenamen kommen aus swgoh.gg (Englisch) und liegen so bereits in
+    counters.attacking_leader/defending_leader -- ein anderes locale würde
+    diese Brücke gegen die eigenen Bestandsdaten kaputt machen, nicht
+    reparieren.
+
+    OFFENE, NICHT durch diese Funktion lösbare Frage: ob comlinks
+    lokalisierter Name für jede Einheit exakt mit character_list.py's
+    swgoh.gg-Scrape-Namen übereinstimmt (z.B. volle vs. abgekürzte Form).
+    Wird hier nicht geprüft -- bot.py's format_zone_attack() behandelt
+    einen Nichttreffer beim Rückwärts-Lookup explizit sichtbar, nicht
+    stillschweigend.
+
+    Raises:
+        RosterFetchError -- einer der beiden Comlink-Calls fehlgeschlagen.
+    """
+    client = _get_client()
+
+    try:
+        game_data = await client.get_game_data(items=DataItems.SEGMENT3)
+    except Exception as e:
+        logger.warning("get_game_data() fehlgeschlagen: %s", e)
+        raise RosterFetchError(str(e)) from e
+
+    units = game_data.get("units", [])
+
+    try:
+        loc = await client.get_localization(locale=locale, unzip=True)
+    except Exception as e:
+        logger.warning("get_localization() fehlgeschlagen: %s", e)
+        raise RosterFetchError(str(e)) from e
+
+    raw_text = loc.get(f"Loc_{locale}.txt", "")
+    loc_map: dict[str, str] = {}
+    for line in raw_text.split("\n"):
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("|", 1)
+        if len(parts) == 2:
+            loc_map[parts[0]] = parts[1]
+
+    names: dict[str, str] = {}
+    for unit in units:
+        unit_id = unit.get("id")
+        name_key = unit.get("nameKey")
+        if not unit_id or not name_key:
+            continue
+        display_name = loc_map.get(name_key)
+        if display_name:
+            names[unit_id] = display_name
+
+    return names

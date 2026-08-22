@@ -117,6 +117,23 @@ CREATE TABLE IF NOT EXISTS swgoh_guild (
     guild_name TEXT,
     set_at     INTEGER NOT NULL
 );
+
+-- unit_id <-> Anzeigename-Brücke (siehe roster.fetch_unit_names()). Bei
+-- jedem Refresh komplett ersetzt (DELETE + INSERT), analog zu
+-- roster_units -- Comlinks Einheitenliste ändert sich mit Patches, nicht
+-- inkrementell aus Bot-Sicht.
+--
+-- WICHTIG, nicht durch dieses Schema lösbar: display_name kommt aus
+-- Comlinks Lokalisierung (ENG_US), NICHT aus character_list.py's
+-- swgoh.gg-Scrape, der die bereits bestehenden Anzeigenamen in
+-- counters.attacking_leader/defending_leader liefert. Ob beide Quellen für
+-- jede Einheit exakt denselben String produzieren, ist unverifiziert --
+-- siehe bot.py's format_zone_attack() für den Umgang mit Nichttreffern.
+CREATE TABLE IF NOT EXISTS unit_names (
+    unit_id      TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    updated_at   INTEGER NOT NULL
+);
 """
 
 # Einzige SQL-seitige Quelle für die Bucket-Grenzen — interpoliert aus
@@ -515,3 +532,56 @@ def save_roster(ally_code: str, player_name: str, units: list[dict]) -> None:
                 for u in units
             ],
         )
+
+
+def save_unit_names(mapping: dict[str, str]) -> None:
+    """
+    Ersetzt die komplette unit_names-Tabelle. `mapping`: {unit_id:
+    display_name}, wie von roster.fetch_unit_names() geliefert. Komplett-
+    Ersatz statt Diffing, analog zu save_roster() -- ein Refresh liefert
+    ohnehin den vollständigen aktuellen Katalog.
+    """
+    with get_connection() as conn:
+        conn.execute("DELETE FROM unit_names")
+        now = int(time.time())
+        conn.executemany(
+            "INSERT INTO unit_names (unit_id, display_name, updated_at) VALUES (?, ?, ?)",
+            [(unit_id, name, now) for unit_id, name in mapping.items()],
+        )
+
+
+def get_display_name_to_unit_id_map() -> dict[str, str]:
+    """
+    Anzeigename -> unit_id, die für /tw_zone_attack mit
+    mitgliederliste=True gebrauchte Richtung: counters.attacking_leader
+    (Anzeigename) muss auf roster_units.unit_id abgebildet werden, nicht
+    umgekehrt. Ein leeres Dict, solange nie ein Refresh gelaufen ist --
+    kein Fehler, der Aufrufer muss das ohnehin pro Angreifer einzeln
+    behandeln (siehe bot.py).
+    """
+    with get_connection() as conn:
+        rows = conn.execute("SELECT unit_id, display_name FROM unit_names").fetchall()
+        return {row["display_name"]: row["unit_id"] for row in rows}
+
+
+def get_owners_of_unit(unit_id: str) -> list[sqlite3.Row]:
+    """
+    Alle Gildenmitglieder, die eine bestimmte Einheit besitzen UND eine
+    verknüpfte Discord-ID haben (INNER JOIN over discord_id IS NOT NULL) --
+    absichtlich nur die, sonst könnte /tw_zone_attack niemanden in Discord
+    markieren. Mitglieder mit Roster-Daten, aber ohne /tw_register, tauchen
+    hier bewusst nicht auf; das ist der bekannte manuelle Schritt, kein Bug.
+    Sortiert nach relic_tier/gear_tier absteigend -- die am besten
+    ausgerüsteten Besitzer zuerst.
+    """
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT p.player_name, p.discord_id, r.gear_tier, r.relic_tier, r.rarity
+            FROM roster_units r
+            JOIN players p ON p.ally_code = r.ally_code
+            WHERE r.unit_id = ? AND p.discord_id IS NOT NULL
+            ORDER BY r.relic_tier DESC, r.gear_tier DESC
+            """,
+            (unit_id,),
+        ).fetchall()

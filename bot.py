@@ -590,6 +590,7 @@ async def tw_zone_add(
 # Datenquelle existiert.
 
 _ZONE_TOP_N = 3
+_ZONE_MAX_MEMBERS = 5
 
 
 def format_zone_attack(
@@ -598,11 +599,23 @@ def format_zone_attack(
     verteidiger_liste: list[str],
     mitgliederliste: bool,
 ) -> str:
-    """Reine Funktion ohne discord.Interaction-Abhängigkeit, wie format_lookup_table."""
+    """
+    Reine Funktion ohne discord.Interaction-Abhängigkeit, wie format_lookup_table.
+
+    mitgliederliste=True hängt an jede empfohlene Angreifer-Zeile an, wer
+    in der Gilde die Einheit besitzt UND einen verknüpften Discord-Account
+    hat (db.get_owners_of_unit() filtert das bereits so). Der Lookup
+    Anzeigename -> unit_id kann fehlschlagen (siehe roster.fetch_unit_names()
+    -- unverifiziert, ob comlinks Lokalisierung exakt character_list.py's
+    swgoh.gg-Namen trifft); ein Fehltreffer wird als sichtbarer Hinweis
+    ausgegeben, nicht stillschweigend als "niemand besitzt das" verwechselt.
+    """
     lines = [f"## Zonen-Angriff: {zone_name}"]
     if zone_image_url:
         lines.append(zone_image_url)  # Discord rendert eine alleinstehende Bild-URL als Vorschau
     lines.append("")
+
+    name_to_unit_id = db.get_display_name_to_unit_id_map() if mitgliederliste else {}
 
     per_defender_top: dict[str, list[str]] = {}
 
@@ -623,12 +636,32 @@ def format_zone_attack(
             even = r["buckets"]["even"]
             total = even["wins"] + even["losses"]
             if total == 0:
-                lines.append(f"- {r['attacker']} — keine Berichte im ausgeglichenen Bucket")
+                line = f"- {r['attacker']} — keine Berichte im ausgeglichenen Bucket"
             else:
                 pct = round((even["wins"] / total) * 100)
-                lines.append(
-                    f"- {r['attacker']} — {pct}% ({even['wins']}/{even['losses']}) ausgeglichen"
-                )
+                line = f"- {r['attacker']} — {pct}% ({even['wins']}/{even['losses']}) ausgeglichen"
+
+            if mitgliederliste:
+                unit_id = name_to_unit_id.get(r["attacker"])
+                if unit_id is None:
+                    line += (
+                        "\n  -# Keine Einheiten-Zuordnung gefunden "
+                        "(Namensraum-Brücke unvollständig für diesen Anführer)."
+                    )
+                else:
+                    owners = db.get_owners_of_unit(unit_id)
+                    if not owners:
+                        line += (
+                            "\n  -# Niemand mit verknüpftem Discord-Account "
+                            "besitzt diese Einheit (laut letztem Roster-Refresh)."
+                        )
+                    else:
+                        mentions = [f"<@{o['discord_id']}>" for o in owners[:_ZONE_MAX_MEMBERS]]
+                        extra = len(owners) - len(mentions)
+                        suffix = f" (+{extra} weitere)" if extra > 0 else ""
+                        line += f"\n  -# Kann besetzt werden von: {', '.join(mentions)}{suffix}"
+
+            lines.append(line)
         lines.append("")
 
     if len(verteidiger_liste) > 1:
@@ -641,13 +674,6 @@ def format_zone_attack(
                 f"**Hedge (deckt mehrere der genannten Verteidiger ab):** {', '.join(hedges)}"
             )
             lines.append("")
-
-    if mitgliederliste:
-        lines.append(
-            "-# Mitgliederliste noch nicht verfügbar — dafür fehlt aktuell eine "
-            "Roster-Datenquelle. Diese Empfehlung zeigt nur, welche Anführer aus "
-            "dem Konter-Katalog in Frage kommen, nicht, wer sie im Kader hat."
-        )
 
     return "\n".join(lines)
 
@@ -914,6 +940,27 @@ if ROSTER_FEATURE_ENABLED:
 
     @refresh_rosters_task.before_loop
     async def before_refresh_rosters_task():
+        await bot.wait_until_ready()
+
+    # ── unit_names-Refresh (Anzeigename-Brücke) ───────────────────────────
+    # Katalogdaten wie character_list.py's Charakterliste -- ändert sich mit
+    # Patches, nicht pro Spieler -- deshalb wöchentliche statt nächtliche
+    # Kadenz, analog zu refresh_characters_task. Trotzdem hier im
+    # ROSTER_FEATURE_ENABLED-Block, weil die Datenquelle (comlink) dieselbe
+    # Abhängigkeit hat wie der Rest dieses Blocks.
+
+    @tasks.loop(hours=168)
+    async def refresh_unit_names_task():
+        try:
+            names = await roster.fetch_unit_names()
+        except roster.RosterFetchError as e:
+            logger.warning("unit_names-Refresh fehlgeschlagen: %s", e)
+            return
+        db.save_unit_names(names)
+        logger.info("unit_names-Refresh abgeschlossen: %d Einheiten.", len(names))
+
+    @refresh_unit_names_task.before_loop
+    async def before_refresh_unit_names_task():
         await bot.wait_until_ready()
 
 
@@ -1345,6 +1392,9 @@ async def on_ready():
 
     if ROSTER_FEATURE_ENABLED and not refresh_rosters_task.is_running():
         refresh_rosters_task.start()
+
+    if ROSTER_FEATURE_ENABLED and not refresh_unit_names_task.is_running():
+        refresh_unit_names_task.start()
 
     guild = discord.Object(id=config.GUILD_ID)
     tree.clear_commands(guild=guild)
