@@ -4,9 +4,14 @@ Verdrahtet config.py (Env/Konstanten), db.py (Event-Log-Modell),
 character_list.py (Autocomplete-Datenquelle), roster.py (Ally-Code-Roster
 über eine selbst gehostete comlink-Instanz) und smartbot.py
 (natürlichsprachlicher Query-Layer über Claude) zu den Slash-Commands
-/tw_add, /tw_report, /tw_lookup, /tw_zone_add, /tw_zone_attack,
-/tw_register, /tw_roster_refresh, /tw_ask, /tw_delete,
-/tw_characterrefresh, /tw_celebrate, /tw_help.
+/tw_add, /tw_report, /tw_lookup, /tw_zone_add, /tw_zone_attack, /tw_ask,
+/tw_delete, /tw_characterrefresh, /tw_celebrate, /tw_help.
+
+/tw_register und /tw_roster_refresh existieren im Code vollständig, sind
+aber über ROSTER_FEATURE_ENABLED (unten, False) deaktiviert, bis eine
+comlink-Instanz produktiv läuft -- Discord bekommt sie aktuell also gar
+nicht erst zum Registrieren angeboten. Auf True setzen, sobald comlink
+deployed ist.
 
 Bewusst keine feste Anzahl mehr genannt (frühere Version sagte "fünf" und
 lief der tatsächlichen Command-Liste zweimal in Folge hinterher) -- bei der
@@ -15,13 +20,13 @@ ohne eine Zahl mitpflegen zu müssen.
 
 Berechtigungsmodell: zwei unabhängige Rollen ohne Administrator-Override.
 SPECIALIST_ROLE_ID gate für /tw_add und /tw_zone_add (Katalogpflege),
-MEMBER_ROLE_ID für /tw_report und /tw_register (beides Selbstbedienung
-für Mitglieder). /tw_delete, /tw_zone_attack und /tw_roster_refresh
+MEMBER_ROLE_ID für /tw_report (und, sobald aktiviert, /tw_register --
+beides Selbstbedienung für Mitglieder). /tw_delete und /tw_zone_attack
 erfordern Administrator ODER Mitgliedschaft in MANAGER_IDS --
 /tw_zone_attack, weil es eine taktische Kriegsnacht-Entscheidung ist statt
-Katalogpflege; /tw_roster_refresh, weil es echte Netzwerklast auf der
-eigenen comlink-Instanz erzeugt und kein Selbstbedienungs-Command wie
-/tw_register ist.
+Katalogpflege. /tw_roster_refresh (deaktiviert) würde aus demselben Grund
+ebenfalls Manager-Rechte erfordern: echte Netzwerklast auf der eigenen
+comlink-Instanz, kein Selbstbedienungs-Command wie /tw_register.
 /tw_lookup, /tw_ask, /tw_celebrate und /tw_help sind für alle offen.
 
 Natürlichsprachliche Anfragen laufen über zwei Trigger auf denselben
@@ -66,6 +71,16 @@ logger = logging.getLogger(__name__)
 intents = discord.Intents.default()
 bot: Bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
+
+# Feature-Flag: der Roster-Mirror (comlink-Anbindung, siehe roster.py) ist
+# bewusst inaktiv, bis eine echte comlink-Instanz läuft (siehe Chat-
+# Verlauf) -- /tw_register und /tw_roster_refresh sollen als Slash-
+# Commands aktuell gar nicht erst bei Discord auftauchen, nicht nur
+# fehlschlagen, wenn man sie aufruft. Auf True setzen, sobald comlink
+# deployed ist -- Commands, Refresh-Task und die zugehörigen /tw_help-
+# Einträge sind vollständig fertig, nur inaktiv, keine weiteren
+# Codeänderungen nötig.
+ROSTER_FEATURE_ENABLED = False
 
 # In-Memory-Cache der Charakternamen fürs Autocomplete. Wird beim Start aus
 # character_list.get_characters() befüllt und wöchentlich über
@@ -679,138 +694,147 @@ tw_zone_attack.autocomplete("verteidiger_2")(character_autocomplete)
 tw_zone_attack.autocomplete("verteidiger_3")(character_autocomplete)
 
 
-# ── /tw_register & Roster-Refresh ────────────────────────────────────────
-# Ally-Code-Registrierung (roster.py) -- Grundlage für eine spätere
-# mitgliederliste=True-Auswertung in /tw_zone_attack (aktuell noch nicht
-# verknüpft, siehe roster.py-Docstring: die Namensraum-Brücke
-# defId<->Anzeigename fehlt noch).
-#
-# Zwei Wege, ein Roster zu aktualisieren:
-#   /tw_register    -- pro Spieler, einmalig bei Registrierung, danach bei
-#                       Bedarf erneut aufrufbar (aktualisiert denselben
-#                       Datensatz statt einen zweiten anzulegen).
-#   refresh_rosters_task -- automatisch, nächtlich, für ALLE registrierten
-#                       Spieler (analog zu refresh_characters_task).
-#   /tw_roster_refresh -- manuell, für ALLE registrierten Spieler, für den
-#                       Fall "TW startet gleich, wer hat sich seit Tagen
-#                       nicht aktualisiert" -- nicht auf den nächtlichen
-#                       Task warten wollen. Manager-Rechte, da es echte
-#                       Netzwerklast auf der eigenen comlink-Instanz
-#                       erzeugt (ein Call pro registriertem Spieler), kein
-#                       Selbstbedienungs-Command wie /tw_register.
+if ROSTER_FEATURE_ENABLED:
+    # /tw_register, /tw_roster_refresh, der Refresh-Task und dessen
+    # before_loop-Hook -- vollständig fertig, aber inaktiv, bis
+    # ROSTER_FEATURE_ENABLED oben auf True gesetzt wird (siehe dortiger
+    # Kommentar). Absichtlich per if-Block statt einzeln auskommentierter
+    # Zeilen deaktiviert: @tree.command-Decorators laufen zur Import-
+    # zeit, ein deaktivierter Block heißt hier also "Discord bekommt
+    # diese Commands nie zum Registrieren angeboten", nicht nur "schlägt
+    # beim Aufruf fehl".
+    # ── /tw_register & Roster-Refresh ────────────────────────────────────────
+    # Ally-Code-Registrierung (roster.py) -- Grundlage für eine spätere
+    # mitgliederliste=True-Auswertung in /tw_zone_attack (aktuell noch nicht
+    # verknüpft, siehe roster.py-Docstring: die Namensraum-Brücke
+    # defId<->Anzeigename fehlt noch).
+    #
+    # Zwei Wege, ein Roster zu aktualisieren:
+    #   /tw_register    -- pro Spieler, einmalig bei Registrierung, danach bei
+    #                       Bedarf erneut aufrufbar (aktualisiert denselben
+    #                       Datensatz statt einen zweiten anzulegen).
+    #   refresh_rosters_task -- automatisch, nächtlich, für ALLE registrierten
+    #                       Spieler (analog zu refresh_characters_task).
+    #   /tw_roster_refresh -- manuell, für ALLE registrierten Spieler, für den
+    #                       Fall "TW startet gleich, wer hat sich seit Tagen
+    #                       nicht aktualisiert" -- nicht auf den nächtlichen
+    #                       Task warten wollen. Manager-Rechte, da es echte
+    #                       Netzwerklast auf der eigenen comlink-Instanz
+    #                       erzeugt (ein Call pro registriertem Spieler), kein
+    #                       Selbstbedienungs-Command wie /tw_register.
 
 
-@tree.command(
-    name="tw_register",
-    description="Registriert deinen Ally-Code und lädt dein aktuelles Roster",
-)
-@app_commands.describe(ally_code="Dein Ally-Code, z.B. 123456789 oder 123-456-789")
-async def tw_register(interaction: discord.Interaction, ally_code: str):
-    if not is_member(interaction):
-        await interaction.response.send_message(
-            "Dieser Befehl ist auf die Rolle der Report-berechtigten Mitglieder beschränkt.",
-            ephemeral=True,
-        )
-        return
-
-    try:
-        normalized = roster.normalize_ally_code(ally_code)
-    except ValueError as e:
-        await interaction.response.send_message(str(e), ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        player_name, units = await roster.fetch_roster(normalized)
-    except roster.AllyCodeNotFoundError as e:
-        await interaction.followup.send(str(e))
-        return
-    except roster.RosterFetchError:
-        logger.exception("Roster-Fetch für Ally-Code %s fehlgeschlagen.", normalized)
-        await interaction.followup.send(
-            "Comlink war gerade nicht erreichbar. Bitte später erneut versuchen."
-        )
-        return
-
-    db.register_player(str(interaction.user.id), normalized)
-    db.save_roster(str(interaction.user.id), player_name, units)
-
-    await interaction.followup.send(
-        f"Registriert als **{player_name}** ({normalized}) — {len(units)} Einheiten geladen."
+    @tree.command(
+        name="tw_register",
+        description="Registriert deinen Ally-Code und lädt dein aktuelles Roster",
     )
-
-
-@tree.command(
-    name="tw_roster_refresh",
-    description="Aktualisiert die Rosterdaten aller registrierten Spieler sofort (Manager/Admin)",
-)
-async def tw_roster_refresh(interaction: discord.Interaction):
-    if not is_manager(interaction):
-        await interaction.response.send_message(
-            "Dieser Befehl erfordert Administrator-Rechte oder Manager-Status.",
-            ephemeral=True,
-        )
-        return
-
-    players = db.get_all_registered_players()
-    if not players:
-        await interaction.response.send_message(
-            "Keine registrierten Spieler.", ephemeral=True
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    updated, failed = await _refresh_all_rosters(players)
-
-    await interaction.followup.send(
-        f"Roster-Refresh abgeschlossen: {updated} aktualisiert, {failed} fehlgeschlagen."
-    )
-
-
-async def _refresh_all_rosters(players: list) -> tuple[int, int]:
-    """
-    Gemeinsame Refresh-Schleife für /tw_roster_refresh und
-    refresh_rosters_task. Sequentiell statt parallel (asyncio.gather) --
-    das ist die selbst gehostete comlink-Instanz, absichtlich kein
-    Ansturm aus N gleichzeitigen Requests gegen das eigentliche Spiel-
-    Backend dahinter. Ein einzelner fehlgeschlagener Spieler bricht den
-    Rest des Durchlaufs nicht ab.
-    """
-    updated = 0
-    failed = 0
-    for row in players:
-        try:
-            player_name, units = await roster.fetch_roster(row["ally_code"])
-            db.save_roster(row["discord_id"], player_name, units)
-            updated += 1
-        except (roster.AllyCodeNotFoundError, roster.RosterFetchError) as e:
-            logger.warning(
-                "Roster-Refresh für discord_id=%s (Ally-Code %s) fehlgeschlagen: %s",
-                row["discord_id"],
-                row["ally_code"],
-                e,
+    @app_commands.describe(ally_code="Dein Ally-Code, z.B. 123456789 oder 123-456-789")
+    async def tw_register(interaction: discord.Interaction, ally_code: str):
+        if not is_member(interaction):
+            await interaction.response.send_message(
+                "Dieser Befehl ist auf die Rolle der Report-berechtigten Mitglieder beschränkt.",
+                ephemeral=True,
             )
-            failed += 1
-    return updated, failed
+            return
+
+        try:
+            normalized = roster.normalize_ally_code(ally_code)
+        except ValueError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            player_name, units = await roster.fetch_roster(normalized)
+        except roster.AllyCodeNotFoundError as e:
+            await interaction.followup.send(str(e))
+            return
+        except roster.RosterFetchError:
+            logger.exception("Roster-Fetch für Ally-Code %s fehlgeschlagen.", normalized)
+            await interaction.followup.send(
+                "Comlink war gerade nicht erreichbar. Bitte später erneut versuchen."
+            )
+            return
+
+        db.register_player(str(interaction.user.id), normalized)
+        db.save_roster(str(interaction.user.id), player_name, units)
+
+        await interaction.followup.send(
+            f"Registriert als **{player_name}** ({normalized}) — {len(units)} Einheiten geladen."
+        )
 
 
-@tasks.loop(hours=24)
-async def refresh_rosters_task():
-    players = db.get_all_registered_players()
-    if not players:
-        return
-    updated, failed = await _refresh_all_rosters(players)
-    logger.info(
-        "Nächtlicher Roster-Refresh abgeschlossen: %d aktualisiert, %d fehlgeschlagen.",
-        updated,
-        failed,
+    @tree.command(
+        name="tw_roster_refresh",
+        description="Aktualisiert die Rosterdaten aller registrierten Spieler sofort (Manager/Admin)",
     )
+    async def tw_roster_refresh(interaction: discord.Interaction):
+        if not is_manager(interaction):
+            await interaction.response.send_message(
+                "Dieser Befehl erfordert Administrator-Rechte oder Manager-Status.",
+                ephemeral=True,
+            )
+            return
+
+        players = db.get_all_registered_players()
+        if not players:
+            await interaction.response.send_message(
+                "Keine registrierten Spieler.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        updated, failed = await _refresh_all_rosters(players)
+
+        await interaction.followup.send(
+            f"Roster-Refresh abgeschlossen: {updated} aktualisiert, {failed} fehlgeschlagen."
+        )
 
 
-@refresh_rosters_task.before_loop
-async def before_refresh_rosters_task():
-    await bot.wait_until_ready()
+    async def _refresh_all_rosters(players: list) -> tuple[int, int]:
+        """
+        Gemeinsame Refresh-Schleife für /tw_roster_refresh und
+        refresh_rosters_task. Sequentiell statt parallel (asyncio.gather) --
+        das ist die selbst gehostete comlink-Instanz, absichtlich kein
+        Ansturm aus N gleichzeitigen Requests gegen das eigentliche Spiel-
+        Backend dahinter. Ein einzelner fehlgeschlagener Spieler bricht den
+        Rest des Durchlaufs nicht ab.
+        """
+        updated = 0
+        failed = 0
+        for row in players:
+            try:
+                player_name, units = await roster.fetch_roster(row["ally_code"])
+                db.save_roster(row["discord_id"], player_name, units)
+                updated += 1
+            except (roster.AllyCodeNotFoundError, roster.RosterFetchError) as e:
+                logger.warning(
+                    "Roster-Refresh für discord_id=%s (Ally-Code %s) fehlgeschlagen: %s",
+                    row["discord_id"],
+                    row["ally_code"],
+                    e,
+                )
+                failed += 1
+        return updated, failed
+
+
+    @tasks.loop(hours=24)
+    async def refresh_rosters_task():
+        players = db.get_all_registered_players()
+        if not players:
+            return
+        updated, failed = await _refresh_all_rosters(players)
+        logger.info(
+            "Nächtlicher Roster-Refresh abgeschlossen: %d aktualisiert, %d fehlgeschlagen.",
+            updated,
+            failed,
+        )
+
+
+    @refresh_rosters_task.before_loop
+    async def before_refresh_rosters_task():
+        await bot.wait_until_ready()
 
 
 # ── /tw_ask & @mention ──────────────────────────────────────────────────
@@ -1107,44 +1131,82 @@ async def tw_celebrate(interaction: discord.Interaction):
     name="tw_help", description="Zeigt alle verfügbaren Bot-Befehle und ihre Verwendung"
 )
 async def tw_help(interaction: discord.Interaction):
-    help_text = (
-        "## TW-Counter Bot — Befehlsübersicht\n\n"
+    # Als Liste einzelner Abschnitte statt eines einzelnen langen Strings,
+    # damit sie sich wie in format_lookup_table (siehe dort) unter
+    # _DISCORD_MESSAGE_LIMIT chunken lässt. Vorherige Version war ein
+    # einziger String, der bei der letzten Erweiterung stillschweigend über
+    # Discords harte 2000-Zeichen-Grenze pro Nachricht gewachsen ist --
+    # send_message() wurde von Discord mit 400 abgelehnt, die Interaction
+    # blieb unbeantwortet ("The application did not respond"). Diese
+    # Chunking-Struktur soll dieselbe Klasse Fehler bei der nächsten
+    # Command-Erweiterung von vornherein ausschließen, statt erneut auf die
+    # Zeichengrenze zu stoßen.
+    sections = [
+        "## TW-Counter Bot — Befehlsübersicht\n",
         "**`/tw_add verteidiger angreifer`** — *Spezialisten-Rolle*\n"
-        "Legt einen leeren Konter an (kein Ergebnis, keine Relic-Werte).\n\n"
+        "Legt einen leeren Konter an (kein Ergebnis, keine Relic-Werte).",
         "**`/tw_report verteidiger verteidiger_relic angreifer angreifer_relic ergebnis banner`** — *Mitglieder-Rolle*\n"
         "Meldet ein Kampfergebnis für einen bereits existierenden Konter. `banner` ist optional bei "
-        "Sieg; bei Niederlage wird er automatisch auf 0 gesetzt, ein trotzdem eingetragener Wert wird überschrieben.\n\n"
+        "Sieg; bei Niederlage wird er automatisch auf 0 gesetzt, ein trotzdem eingetragener Wert wird überschrieben.",
         "**`/tw_lookup verteidiger`** — *alle*\n"
         "Zeigt alle Konter gegen einen Verteidiger, sortiert nach Ausgeglichen-Quote, "
         "inklusive Durchschnitts-Banner als vierte Spalte (nur für Angreifer mit mindestens "
-        "einer Banner-Angabe).\n\n"
+        "einer Banner-Angabe).",
         "**`/tw_zone_add name bild_url`** — *Spezialisten-Rolle*\n"
-        "Legt eine TW-Zone an (Kartenreferenz für `/tw_zone_attack`).\n\n"
+        "Legt eine TW-Zone an (Kartenreferenz für `/tw_zone_attack`).",
         "**`/tw_zone_attack zone verteidiger_1 verteidiger_2 verteidiger_3 mitgliederliste`** — *Manager/Admin*\n"
         "Empfiehlt Angreifer für eine Zone anhand von bis zu drei möglichen Verteidigern, "
         "inklusive Hedge-Hinweis bei mehrdeutiger Scouting-Lage. `mitgliederliste` ist als "
-        "Schnittstelle angelegt, liefert aber noch keine echten Mitgliedernamen (fehlende Namensraum-Brücke).\n\n"
-        "**`/tw_register ally_code`** — *Mitglieder-Rolle*\n"
-        "Registriert deinen Ally-Code und lädt dein aktuelles Roster aus dem Spiel.\n\n"
-        "**`/tw_roster_refresh`** — *Manager/Admin*\n"
-        "Aktualisiert die Rosterdaten aller registrierten Spieler sofort, statt auf den "
-        "nächtlichen automatischen Refresh zu warten.\n\n"
+        "Schnittstelle angelegt, liefert aber noch keine echten Mitgliedernamen (fehlende Namensraum-Brücke).",
         "**`/tw_ask frage`** — *alle*\n"
         "Beantwortet eine Frage in natürlicher Sprache (Deutsch oder Englisch), "
         "z.B. 'was kontert Darth Vader?'. Alternativ: den Bot in einer normalen "
-        "Nachricht @mentionen und die Frage direkt dranschreiben.\n\n"
+        "Nachricht @mentionen und die Frage direkt dranschreiben.",
         "**`/tw_delete verteidiger angreifer`** — *Manager/Admin*\n"
-        "Löscht einen Konter samt aller Reports, nach Bestätigung.\n\n"
+        "Löscht einen Konter samt aller Reports, nach Bestätigung.",
         "**`/tw_characterrefresh datei`** — *Owner*\n"
         "Lädt eine manuell gespeicherte Kopie von swgoh.gg/characters/ hoch und "
-        "aktualisiert die Autocomplete-Daten sofort.\n\n"
+        "aktualisiert die Autocomplete-Daten sofort.",
         "**`/tw_celebrate`** — *alle*\n"
-        "Zeigt die Top 3 Melder der meisten TW-Reports.\n\n"
-        "**`/tw_help`** — Zeigt diese Übersicht.\n\n"
+        "Zeigt die Top 3 Melder der meisten TW-Reports.",
+        "**`/tw_help`** — Zeigt diese Übersicht.",
         "-# Relic-Delta = Angreifer-Relic − Verteidiger-Relic. "
-        "≤ -3 unterlegen, -2..+2 ausgeglichen, ≥ +3 überlegen."
-    )
-    await interaction.response.send_message(help_text, ephemeral=True)
+        "≤ -3 unterlegen, -2..+2 ausgeglichen, ≥ +3 überlegen.",
+    ]
+
+    # /tw_register und /tw_roster_refresh nur auflisten, wenn sie auch
+    # tatsächlich bei Discord registriert sind (siehe ROSTER_FEATURE_ENABLED
+    # oben) -- sonst würde /tw_help Befehle bewerben, die gar nicht
+    # existieren.
+    if ROSTER_FEATURE_ENABLED:
+        sections.insert(
+            6,
+            "**`/tw_register ally_code`** — *Mitglieder-Rolle*\n"
+            "Registriert deinen Ally-Code und lädt dein aktuelles Roster aus dem Spiel.",
+        )
+        sections.insert(
+            7,
+            "**`/tw_roster_refresh`** — *Manager/Admin*\n"
+            "Aktualisiert die Rosterdaten aller registrierten Spieler sofort, statt auf den "
+            "nächtlichen automatischen Refresh zu warten.",
+        )
+
+    messages: list[str] = []
+    chunk: list[str] = []
+    chunk_len = 0
+    for section in sections:
+        if chunk and chunk_len + len(section) + 2 > _DISCORD_MESSAGE_LIMIT:
+            messages.append("\n\n".join(chunk))
+            chunk = []
+            chunk_len = 0
+        chunk.append(section)
+        chunk_len += len(section) + 2
+    if chunk:
+        messages.append("\n\n".join(chunk))
+
+    await interaction.response.send_message(messages[0], ephemeral=True)
+    for extra in messages[1:]:
+        await interaction.followup.send(extra, ephemeral=True)
 
 
 # ── Wöchentlicher Charakter-Refresh ───────────────────────────────────────
@@ -1193,7 +1255,7 @@ async def on_ready():
     if not refresh_characters_task.is_running():
         refresh_characters_task.start()
 
-    if not refresh_rosters_task.is_running():
+    if ROSTER_FEATURE_ENABLED and not refresh_rosters_task.is_running():
         refresh_rosters_task.start()
 
     guild = discord.Object(id=config.GUILD_ID)

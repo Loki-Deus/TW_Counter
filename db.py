@@ -18,11 +18,14 @@ Mindestanforderung.
 """
 
 import json
+import logging
 import sqlite3
 import time
 from contextlib import contextmanager
 
 from config import DB_PATH, OVER_THRESHOLD, UNDER_THRESHOLD
+
+logger = logging.getLogger(__name__)
 
 
 class CounterExistsError(Exception):
