@@ -564,13 +564,30 @@ def get_display_name_to_unit_id_map() -> dict[str, str]:
         return {row["display_name"]: row["unit_id"] for row in rows}
 
 
-def get_owners_of_unit(unit_id: str) -> list[sqlite3.Row]:
+def get_owners_of_unit(unit_id: str, min_relic_tier: int = 0) -> list[sqlite3.Row]:
     """
-    Alle Gildenmitglieder, die eine bestimmte Einheit besitzen UND eine
-    verknüpfte Discord-ID haben (INNER JOIN over discord_id IS NOT NULL) --
-    absichtlich nur die, sonst könnte /tw_zone_attack niemanden in Discord
-    markieren. Mitglieder mit Roster-Daten, aber ohne /tw_register, tauchen
-    hier bewusst nicht auf; das ist der bekannte manuelle Schritt, kein Bug.
+    Gildenmitglieder, die eine bestimmte Einheit besitzen -- MIT und OHNE
+    verknüpfte Discord-ID (kein Filter mehr auf discord_id IS NOT NULL,
+    siehe Chat-Verlauf: frühere Version schloss unregistrierte Mitglieder
+    komplett aus, statt sie namentlich ohne Ping zu zeigen). discord_id ist
+    NULL für Mitglieder ohne /tw_register -- der Aufrufer (bot.py's
+    format_zone_attack()) muss das selbst unterscheiden: nur bei
+    vorhandener discord_id pingen, sonst player_name als Klartext anzeigen.
+
+    min_relic_tier filtert Besitzer ohne einsatzfähiges Relic-Level heraus
+    (Stakeholder-Vorgabe: level-1-Besitz ohne Relic ist für eine
+    Angriffsempfehlung nicht relevant). relic_tier IS NULL (keine
+    Relic-Angabe überhaupt, z.B. Einheit unterhalb Gear 13) wird IMMER
+    ausgeschlossen, unabhängig vom Schwellwert.
+
+    min_relic_tier erwartet comlinks ROHEN Wert, nicht die im Spiel
+    angezeigte Relic-Stufe -- die beiden sind NICHT identisch, siehe
+    config.relic_tier_to_display() für die verifizierte Umrechnung
+    (roher Wert - 2 = echte Relic-Stufe, bestätigt gegen die offizielle
+    relicTierDefinition-Tabelle UND einen echten Live-Datenpunkt). Der
+    Aufrufer (bot.py) übergibt bereits einen über
+    config.display_relic_to_raw() umgerechneten Wert.
+
     Sortiert nach relic_tier/gear_tier absteigend -- die am besten
     ausgerüsteten Besitzer zuerst.
     """
@@ -580,10 +597,10 @@ def get_owners_of_unit(unit_id: str) -> list[sqlite3.Row]:
             SELECT p.player_name, p.discord_id, r.gear_tier, r.relic_tier, r.rarity
             FROM roster_units r
             JOIN players p ON p.ally_code = r.ally_code
-            WHERE r.unit_id = ? AND p.discord_id IS NOT NULL
+            WHERE r.unit_id = ? AND r.relic_tier IS NOT NULL AND r.relic_tier >= ?
             ORDER BY r.relic_tier DESC, r.gear_tier DESC
             """,
-            (unit_id,),
+            (unit_id, min_relic_tier),
         ).fetchall()
 
 

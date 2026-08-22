@@ -607,6 +607,15 @@ async def tw_zone_add(
 
 _ZONE_TOP_N = 3
 _ZONE_MAX_MEMBERS = 5
+# Mindest-Relic-Level für eine Angriffsempfehlung (Stakeholder-Vorgabe:
+# Level-1-Besitz ohne Relic zählt nicht als einsatzfähig), formuliert als
+# ECHTE, im Spiel angezeigte Relic-Stufe -- die Umrechnung auf comlinks
+# rohen DB-Wert übernimmt config.display_relic_to_raw(), VERIFIZIERT gegen
+# die offizielle relicTierDefinition-Tabelle UND einen echten Live-
+# Datenpunkt (siehe dortiger Kommentar). Um den Schwellwert zu ändern,
+# NUR diese Zahl anpassen, nicht den Rohwert von Hand ausrechnen.
+_MIN_DISPLAY_RELIC_FOR_ATTACK = 1
+_MIN_RELIC_TIER_FOR_ATTACK = config.display_relic_to_raw(_MIN_DISPLAY_RELIC_FOR_ATTACK)
 
 
 def format_zone_attack(
@@ -665,17 +674,26 @@ def format_zone_attack(
                         "(Namensraum-Brücke unvollständig für diesen Anführer)."
                     )
                 else:
-                    owners = db.get_owners_of_unit(unit_id)
+                    owners = db.get_owners_of_unit(unit_id, min_relic_tier=_MIN_RELIC_TIER_FOR_ATTACK)
                     if not owners:
                         line += (
-                            "\n  -# Niemand mit verknüpftem Discord-Account "
-                            "besitzt diese Einheit (laut letztem Roster-Refresh)."
+                            "\n  -# Niemand in der Gilde besitzt diese Einheit auf "
+                            "einsatzfähigem Relic-Level (laut letztem Roster-Refresh)."
                         )
                     else:
-                        mentions = [f"<@{o['discord_id']}>" for o in owners[:_ZONE_MAX_MEMBERS]]
-                        extra = len(owners) - len(mentions)
+                        # Nur tatsächlich per /tw_register verknüpfte
+                        # Mitglieder werden gepingt (<@discord_id>) -- das
+                        # ist ein bewusstes Opt-in, niemand wird ungefragt
+                        # in Discord markiert. Unregistrierte Besitzer
+                        # erscheinen trotzdem, nur als Klartext-Ingame-Name
+                        # statt als Mention.
+                        labels = [
+                            f"<@{o['discord_id']}>" if o["discord_id"] else o["player_name"]
+                            for o in owners[:_ZONE_MAX_MEMBERS]
+                        ]
+                        extra = len(owners) - len(labels)
                         suffix = f" (+{extra} weitere)" if extra > 0 else ""
-                        line += f"\n  -# Kann besetzt werden von: {', '.join(mentions)}{suffix}"
+                        line += f"\n  -# Kann besetzt werden von: {', '.join(labels)}{suffix}"
 
             lines.append(line)
         lines.append("")
