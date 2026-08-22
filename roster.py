@@ -17,20 +17,38 @@ toleriert" ist nicht dasselbe wie "vertraglich abgesichert" -- eigene
 Einschätzung nötig, bevor darauf ein bezahltes Produkt aufgebaut wird,
 siehe Chat-Verlauf.
 
-+++ WICHTIG, vor Produktivbetrieb zwingend zu verifizieren +++
-_parse_roster_unit() unten geht von Feldnamen aus, die aus Dokumentation
-benachbarter Comlink-Ökosystem-Projekte zusammengetragen wurden
-(swgoh-stat-calc, comlink-python), NICHT aus einem tatsächlichen Response
-einer laufenden Instanz -- die Entwicklungsumgebung, in der dieses Modul
-geschrieben wurde, hatte keinen Netzwerkzugriff auf eine comlink-Instanz.
-Vor dem ersten produktiven /tw_register: einen echten get_player()-Call
-gegen die laufende Instanz absetzen, die Rohstruktur von rosterUnit[0]
-loggen (z.B. kurzzeitig ein `logger.info(json.dumps(raw_unit))` in
-_parse_roster_unit() einfügen), und die Feldzuordnungen unten bei
-Abweichung korrigieren. Die Omicron-Erkennung ist unterhalb davon sogar
-nur ein Platzhalter (immer []), weil die exakte Skill-Struktur dafür noch
-gar nicht recherchiert wurde -- nicht nur unverifiziert, sondern absichtlich
-nicht implementiert, bis das nachgeholt ist.
++++ VERIFIZIERT gegen einen echten Response (siehe Chat-Verlauf) +++
+_parse_roster_unit()'s Feldannahmen (definitionId, currentRarity,
+currentTier, relic.currentTier) stimmen exakt mit einem echten
+get_player()-Response überein -- geprüft anhand eines realen Beispiels
+(MAGMATROOPER, Ally-Code des Bot-Betreibers). Nur die Omicron-Erkennung
+bleibt ein Platzhalter (immer []): die geprüfte Einheit hatte keine
+Fähigkeit über Tier 6 hinaus, es fehlt also weiterhin ein Beispiel mit
+tatsächlich gesetztem Omicron, um den dafür entscheidenden Tier-Wert zu
+bestimmen.
+
++++ VERIFIZIERT, mit einer Korrektur gegenüber dem ursprünglichen Entwurf +++
+fetch_guild_members() ist jetzt gegen einen echten get_guild()-Response
+geprüft. Zwei Dinge bestätigt: (1) der comlink-Python-Client entfernt den
+äußeren "guild"-Schlüssel selbst (siehe SwgohComlinkAsync.get_guild()-
+Quelltext) -- ein rohes HTTP POST an /guild liefert zwar
+{"guild": {"member": [...]}}, der Wrapper aber bereits das entpackte
+{"member": [...]}; (2) jedes Mitglied trägt "playerId" -- ABER das ist
+NICHT der Ally-Code, sondern eine andere, base64-artige interne ID (z.B.
+"Xk7RXvj_SSSgst2qxR8lNQ"). Der comlink-Python-Client akzeptiert diese
+playerId direkt als player_id=-Argument von get_player() (bestätigte
+Signatur), und die volle Antwort enthält dann sowohl den echten Ally-Code
+(als Klartextfeld "allyCode") als auch das komplette Roster in einem
+einzigen Call -- kein zusätzlicher Auflösungsschritt nötig. fetch_roster()
+unten unterstützt deshalb beide Zugriffswege (ally_code= für /tw_register,
+player_id= für guild-weit entdeckte Mitglieder) und liest den Ally-Code
+immer aus der Antwort selbst, nie vom Aufrufer übernommen.
+
+Noch nicht geprüft: nichts mehr an dieser Stelle -- die ursprünglich offene
+Frage nach dem Gildennamen hat sich als hinfällig herausgestellt:
+guildName liegt direkt als Klartextfeld auf der player-Antwort,
+resolve_guild_id() braucht dafür gar keinen separaten get_guild()-Call
+mehr (siehe dortiger Docstring).
 
 Speichert NUR normalisierte Werte (rarity, gear_tier, relic_tier,
 omicrons) in db.py, nicht den rohen Comlink-Response.
@@ -116,30 +134,114 @@ def _parse_roster_unit(raw_unit: dict) -> dict:
     }
 
 
-async def fetch_roster(ally_code: str) -> tuple[str, list[dict]]:
+async def fetch_roster(
+    ally_code: str | None = None, player_id: str | None = None
+) -> tuple[str, str, list[dict]]:
     """
-    Holt das komplette Roster für einen (bereits normalisierten) Ally-Code.
-    Gibt (player_name, units) zurück, units als Liste von
-    _parse_roster_unit()-Dicts.
+    Holt das komplette Roster für einen Spieler -- entweder über Ally-Code
+    ODER über comlinks interne playerId (genau eines von beiden). playerId
+    ist der Weg für guild-weit entdeckte Mitglieder (siehe
+    fetch_guild_members() -- die Gilden-Mitgliederliste enthält NUR
+    playerId, keinen Ally-Code, bestätigt gegen einen echten Response).
+    ally_code bleibt der Weg für /tw_register, wo der Nutzer ihn direkt angibt.
+
+    Gibt (ally_code, player_name, units) zurück -- ally_code wird IMMER aus
+    der vollen Antwort gelesen (player_data['allyCode']), nicht vom
+    Aufrufer übernommen: bei einem player_id-Aufruf kennt der Aufrufer den
+    Ally-Code vorher noch gar nicht, der steht erst in der Antwort
+    (bestätigt: player_data enthält 'allyCode' als Klartext-Feld,
+    unabhängig davon ob per allycode= oder player_id= abgefragt wurde).
 
     Raises:
-        AllyCodeNotFoundError -- comlink kennt den Ally-Code nicht.
+        AllyCodeNotFoundError -- Ally-Code/playerId comlink unbekannt.
+        RosterFetchError -- Comlink-Call aus anderem Grund fehlgeschlagen.
+    """
+    if not ally_code and not player_id:
+        raise ValueError("Entweder ally_code oder player_id muss angegeben werden.")
+
+    client = _get_client()
+    identifier = player_id or ally_code
+    try:
+        if player_id:
+            player_data = await client.get_player(player_id=player_id)
+        else:
+            player_data = await client.get_player(allycode=ally_code)
+    except Exception as e:
+        logger.warning("Comlink-Fetch für %s fehlgeschlagen: %s", identifier, e)
+        raise RosterFetchError(str(e)) from e
+
+    if not player_data or "rosterUnit" not in player_data:
+        raise AllyCodeNotFoundError(f"Kein Spieler gefunden ({identifier}).")
+
+    resolved_ally_code = player_data.get("allyCode", ally_code or "")
+    units = [_parse_roster_unit(u) for u in player_data["rosterUnit"]]
+    return resolved_ally_code, player_data.get("name", ""), units
+
+
+async def resolve_guild_id(seed_ally_code: str) -> tuple[str, str]:
+    """
+    Ermittelt die interne SWGOH-Gilden-ID über einen bereits bekannten
+    Ally-Code (comlink hat keine Freitext-Gildensuche). Gibt (guild_id,
+    guild_name) zurück -- BEIDES aus einem einzigen get_player()-Call:
+    guildId UND guildName liegen als Klartextfelder direkt auf der
+    player-Antwort, bestätigt gegen einen echten Response (siehe Chat-
+    Verlauf). Kein zusätzlicher get_guild()-Call nötig, um an den
+    Gildennamen zu kommen -- ursprünglich (unverifiziert) angenommen,
+    inzwischen als unnötig erkannt: ein Aufruf weniger, ein Fehlerpfad
+    weniger.
+
+    Raises:
+        AllyCodeNotFoundError -- Ally-Code unbekannt ODER in keiner Gilde.
         RosterFetchError -- Comlink-Call aus anderem Grund fehlgeschlagen.
     """
     client = _get_client()
     try:
-        player_data = await client.get_player(allycode=ally_code)
+        player_data = await client.get_player(allycode=seed_ally_code)
     except Exception as e:
-        # swgoh_comlink wirft je nach Fehlerart unterschiedliche
-        # Exception-Klassen -- hier bewusst breit gefangen und in eine
-        # eigene Exception übersetzt, damit bot.py nicht wissen muss,
-        # welche Exceptions ausgerechnet dieses HTTP-Client-Paket intern
-        # wirft.
-        logger.warning("Comlink-Fetch für Ally-Code %s fehlgeschlagen: %s", ally_code, e)
+        logger.warning("Guild-ID-Auflösung über Ally-Code %s fehlgeschlagen: %s", seed_ally_code, e)
         raise RosterFetchError(str(e)) from e
 
-    if not player_data or "rosterUnit" not in player_data:
-        raise AllyCodeNotFoundError(f"Kein Spieler für Ally-Code {ally_code} gefunden.")
+    guild_id = player_data.get("guildId")
+    if not guild_id:
+        raise AllyCodeNotFoundError(
+            f"Ally-Code {seed_ally_code} ist laut Comlink in keiner Gilde "
+            f"(kein guildId im Response)."
+        )
 
-    units = [_parse_roster_unit(u) for u in player_data["rosterUnit"]]
-    return player_data.get("name", ""), units
+    return guild_id, player_data.get("guildName", "")
+
+
+async def fetch_guild_members(guild_id: str) -> list[str]:
+    """
+    Liefert eine Liste von playerId-Werten -- comlinks interne, base64-
+    artige Spieler-ID (z.B. "Xk7RXvj_SSSgst2qxR8lNQ"), AUSDRÜCKLICH KEIN
+    Ally-Code, bestätigt gegen einen echten Response (siehe Chat-Verlauf).
+    Weder Ally-Code noch ein nutzbarer Spielername liegen in der
+    Mitgliederliste selbst vor (playerName ist dort durchgängig leer) --
+    beides muss über einen anschließenden fetch_roster(player_id=...)-Call
+    pro Mitglied geholt werden, siehe bot.py's _refresh_guild_rosters().
+
+    guild_data.get("member", ...) ist hier absichtlich flach, ohne einen
+    äußeren "guild"-Schlüssel zu erwarten: der comlink-Python-Client
+    (SwgohComlinkAsync.get_guild(), siehe dessen Quelltext) entfernt diesen
+    äußeren Schlüssel bereits selbst, bevor er das Dict zurückgibt. Ein rohes
+    HTTP POST an /guild liefert dagegen {"guild": {"member": [...]}} --
+    dieser Unterschied ist keine Schema-Unsicherheit mehr, sondern eine
+    bestätigte Eigenschaft des Wrapper-Pakets.
+
+    Raises:
+        AllyCodeNotFoundError -- guild_id bei comlink unbekannt.
+        RosterFetchError -- Comlink-Call aus anderem Grund fehlgeschlagen.
+    """
+    client = _get_client()
+    try:
+        guild_data = await client.get_guild(guild_id)
+    except Exception as e:
+        logger.warning("get_guild(%s) fehlgeschlagen: %s", guild_id, e)
+        raise RosterFetchError(str(e)) from e
+
+    if not guild_data:
+        raise AllyCodeNotFoundError(f"Keine Gilde für guild_id {guild_id} gefunden.")
+
+    members = guild_data.get("member", [])
+    return [m["playerId"] for m in members if m.get("playerId")]

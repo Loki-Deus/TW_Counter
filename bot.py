@@ -805,7 +805,9 @@ if ROSTER_FEATURE_ENABLED:
         await interaction.response.defer(ephemeral=True)
 
         try:
-            player_name, units = await roster.fetch_roster(normalized)
+            resolved_ally_code, player_name, units = await roster.fetch_roster(
+                ally_code=normalized
+            )
         except roster.AllyCodeNotFoundError as e:
             await interaction.followup.send(str(e))
             return
@@ -816,12 +818,12 @@ if ROSTER_FEATURE_ENABLED:
             )
             return
 
-        db.upsert_player(normalized, player_name)
-        db.save_roster(normalized, player_name, units)
-        db.link_discord_id(normalized, str(interaction.user.id))
+        db.upsert_player(resolved_ally_code, player_name)
+        db.save_roster(resolved_ally_code, player_name, units)
+        db.link_discord_id(resolved_ally_code, str(interaction.user.id))
 
         await interaction.followup.send(
-            f"Verknüpft mit **{player_name}** ({normalized}) — {len(units)} Einheiten geladen. "
+            f"Verknüpft mit **{player_name}** ({resolved_ally_code}) — {len(units)} Einheiten geladen. "
             f"Dein Roster wird ab jetzt auch beim nächtlichen Gilden-Refresh automatisch aktualisiert."
         )
 
@@ -854,9 +856,12 @@ if ROSTER_FEATURE_ENABLED:
     async def _refresh_guild_rosters() -> tuple[int, int]:
         """
         Zieht die komplette Mitgliederliste der hinterlegten SWGOH-Gilde
-        über comlink (roster.fetch_guild_members()) und aktualisiert JEDEN
-        gefundenen Spieler -- nicht mehr beschränkt auf die, die zufällig
-        /tw_register genutzt haben.
+        über comlink (roster.fetch_guild_members() liefert playerId-Werte,
+        siehe dortiger Docstring) und aktualisiert JEDEN gefundenen
+        Spieler -- nicht mehr beschränkt auf die, die zufällig
+        /tw_register genutzt haben. Der Ally-Code jedes Mitglieds kommt
+        erst aus der Antwort von roster.fetch_roster(player_id=...), nicht
+        aus der Gilden-Mitgliederliste selbst (die liefert nur playerId).
 
         Sequentiell statt parallel (asyncio.gather): das ist die selbst
         gehostete comlink-Instanz, absichtlich kein Ansturm aus N
@@ -874,23 +879,24 @@ if ROSTER_FEATURE_ENABLED:
             return 0, 0
 
         try:
-            members = await roster.fetch_guild_members(guild_row["guild_id"])
+            player_ids = await roster.fetch_guild_members(guild_row["guild_id"])
         except (roster.AllyCodeNotFoundError, roster.RosterFetchError) as e:
             logger.warning("Gilden-Mitgliederliste konnte nicht geladen werden: %s", e)
             return 0, 0
 
         updated = 0
         failed = 0
-        for member in members:
-            ally_code = member["ally_code"]
+        for player_id in player_ids:
             try:
-                player_name, units = await roster.fetch_roster(ally_code)
+                ally_code, player_name, units = await roster.fetch_roster(
+                    player_id=player_id
+                )
                 db.upsert_player(ally_code, player_name)
                 db.save_roster(ally_code, player_name, units)
                 updated += 1
             except (roster.AllyCodeNotFoundError, roster.RosterFetchError) as e:
                 logger.warning(
-                    "Roster-Refresh für Ally-Code %s fehlgeschlagen: %s", ally_code, e
+                    "Roster-Refresh für playerId %s fehlgeschlagen: %s", player_id, e
                 )
                 failed += 1
         return updated, failed
