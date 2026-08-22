@@ -1,17 +1,31 @@
 """
 TW-Counter-Bot — Discord-Bot für SWGOH-Territory-War-Konter.
-Verdrahtet config.py (Env/Konstanten), db.py (Event-Log-Modell),
-character_list.py (Autocomplete-Datenquelle), roster.py (Ally-Code-Roster
-über eine selbst gehostete comlink-Instanz) und smartbot.py
-(natürlichsprachlicher Query-Layer über Claude) zu den Slash-Commands
-/tw_add, /tw_report, /tw_lookup, /tw_zone_add, /tw_zone_attack, /tw_ask,
-/tw_delete, /tw_characterrefresh, /tw_celebrate, /tw_help.
+Verdrahtet config.py (Env/Konstanten), db.py (Event-Log-Modell), roster.py
+(Ally-Code-Roster UND Charakter-Katalog über eine selbst gehostete
+comlink-Instanz) und smartbot.py (natürlichsprachlicher Query-Layer über
+Claude) zu den Slash-Commands /tw_add, /tw_report, /tw_lookup,
+/tw_zone_add, /tw_zone_attack, /tw_ask, /tw_delete, /tw_celebrate,
+/tw_help.
+
+character_list.py (swgoh.gg-HTML-Scrape, /tw_characterrefresh) wurde
+retired, siehe Chat-Verlauf -- der Charakter-Katalog für Autocomplete kommt
+jetzt aus db.get_owned_unit_display_names(): Comlinks Einheitenkatalog
+(roster.fetch_unit_names(), wöchentlich aktualisiert) gejoint gegen
+roster_units, also gefiltert auf tatsächlich von der Gilde besessene
+Einheiten statt des vollen ~11000-Einheiten-Katalogs. Kein manueller
+HTML-Upload mehr nötig. beautifulsoup4 ist damit keine Abhängigkeit mehr
+(siehe requirements.txt).
 
 /tw_register und /tw_roster_refresh existieren im Code vollständig, sind
 aber über ROSTER_FEATURE_ENABLED (unten, False) deaktiviert, bis eine
 comlink-Instanz produktiv läuft -- Discord bekommt sie aktuell also gar
 nicht erst zum Registrieren angeboten. Auf True setzen, sobald comlink
-deployed ist.
+deployed ist. WICHTIG, seit der Ablösung von character_list.py: der
+gesamte Charakter-Katalog (character_autocomplete(), /tw_ask) hängt jetzt
+ebenfalls an comlink UND an mindestens einem abgeschlossenen Roster-
+Refresh -- ohne das ist die Autocomplete-Liste leer, nicht nur die
+Roster-Funktionen. Das ist eine echte neue Abhängigkeit gegenüber vorher
+(character_list.py war komplett unabhängig von comlink).
 
 Wenn aktiv, läuft der Roster-Refresh guild-weit über comlinks
 Mitgliederliste (roster.fetch_guild_members()), nicht nur für einzeln per
@@ -55,7 +69,6 @@ from discord.ext.commands import Bot
 
 import config
 import db
-import character_list
 import roster
 import smartbot
 
@@ -88,17 +101,13 @@ tree = bot.tree
 # Codeänderungen nötig.
 ROSTER_FEATURE_ENABLED = True
 
-# In-Memory-Cache der Charakternamen fürs Autocomplete. Wird beim Start aus
-# character_list.get_characters() befüllt und wöchentlich über
-# refresh_characters_task erneuert. Absichtlich nur die Namen (nicht die
-# Slugs) — die DB speichert defending_leader/attacking_leader als TEXT ohne
-# Fremdschlüssel auf eine Charaktertabelle, der Slug wird hier nicht gebraucht.
-character_names: list[str] = []
-
-
-def _set_character_names(characters: dict[str, str]) -> None:
-    global character_names
-    character_names = sorted(characters.values())
+# Kein In-Memory-Cache für den Charakter-Katalog mehr (siehe Chat-Verlauf,
+# character_list.py wurde retired) -- character_autocomplete() und
+# smartbot.answer_query() lesen db.get_owned_unit_display_names() direkt,
+# analog zu zone_autocomplete()'s bereits etabliertem Muster. Die Liste ist
+# klein genug (nur tatsächlich besessene Einheiten, nicht der volle
+# 11000+-Comlink-Katalog), dass ein Cache hier keinen echten Vorteil
+# brächte, nur eine zusätzliche Invalidierungsquelle.
 
 
 # ── Berechtigungs-Helfer ──────────────────────────────────────────────────
@@ -128,10 +137,11 @@ def is_manager(interaction: discord.Interaction) -> bool:
     )
 
 
-def is_owner(interaction: discord.Interaction) -> bool:
-    """/tw_characterrefresh: nur die exakte OWNER_ID. Kein Administrator-Override,
-    keine Überschneidung mit MANAGER_IDS — bewusst der engste Kreis im Bot."""
-    return interaction.user.id == config.OWNER_ID
+# is_owner() entfernt (siehe Chat-Verlauf): war ausschließlich für
+# /tw_characterrefresh, das mit der Ablösung von character_list.py
+# ebenfalls entfernt wurde. config.OWNER_ID bleibt vorerst als Pflicht-
+# Env-Var bestehen (siehe config.py) -- absichtlich nicht in derselben
+# Änderung mit angefasst, um den Deploy-Blast-Radius klein zu halten.
 
 
 # ── Autocomplete ──────────────────────────────────────────────────────────
@@ -152,10 +162,16 @@ def filter_autocomplete(current: str, options: list[str], limit: int = 25) -> li
 async def character_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
-    """Voller Charakter-Katalog — für /tw_add (beide Parameter) und /tw_lookup/verteidiger."""
+    """
+    Katalog für /tw_add (beide Parameter), /tw_lookup/verteidiger,
+    /tw_zone_attack/verteidiger_*. Direkt aus der DB gelesen
+    (db.get_owned_unit_display_names()) statt aus einem In-Memory-Cache --
+    siehe dortige Docstring zum Tradeoff (nur tatsächlich von der Gilde
+    besessene Einheiten, kein voller Comlink-Katalog).
+    """
     return [
         app_commands.Choice(name=n, value=n)
-        for n in filter_autocomplete(current, character_names)
+        for n in filter_autocomplete(current, db.get_owned_unit_display_names())
     ]
 
 
@@ -987,7 +1003,7 @@ if ROSTER_FEATURE_ENABLED:
 async def tw_ask(interaction: discord.Interaction, frage: str):
     await interaction.response.defer()
     try:
-        answer = await smartbot.answer_query(frage, character_names)
+        answer = await smartbot.answer_query(frage, db.get_owned_unit_display_names())
     except Exception:
         logger.exception("smartbot.answer_query fehlgeschlagen für Frage: %s", frage)
         await interaction.followup.send(
@@ -1033,7 +1049,7 @@ async def on_message(message: discord.Message):
         else:
             async with message.channel.typing():
                 try:
-                    answer = await smartbot.answer_query(frage, character_names)
+                    answer = await smartbot.answer_query(frage, db.get_owned_unit_display_names())
                 except Exception:
                     logger.exception(
                         "smartbot.answer_query fehlgeschlagen für Mention-Frage: %s",
@@ -1128,85 +1144,6 @@ tw_delete.autocomplete("verteidiger")(character_autocomplete)
 tw_delete.autocomplete("angreifer")(attacker_for_defender_autocomplete)
 
 
-# ── /tw_characterrefresh ─────────────────────────────────────────────────
-# swgoh.gg/characters/ läuft hinter einer aktiven Cloudflare-JS-Challenge,
-# die kein automatisierter Client lösen kann. Die Charakterliste kommt daher
-# aus einer manuell im Browser gespeicherten Kopie, die hier hochgeladen
-# wird. Reihenfolge ist bewusst: erst parsen und validieren, DANN erst die
-# bestehende Datei überschreiben — eine fehlgeschlagene Validierung darf
-# niemals eine funktionierende swgoh_characters.html zerstören.
-
-_MAX_CHARACTER_UPLOAD_BYTES = 5 * 1024 * 1024  # reale Seite liegt bei ~550 KB
-
-
-@tree.command(
-    name="tw_characterrefresh",
-    description="Aktualisiert die Charakterliste aus einer hochgeladenen Kopie von swgoh.gg/characters/ (nur Owner)",
-)
-@app_commands.describe(
-    datei="Im Browser gespeicherte HTML-Kopie von https://swgoh.gg/characters/"
-)
-async def tw_characterrefresh(
-    interaction: discord.Interaction, datei: discord.Attachment
-):
-    if not is_owner(interaction):
-        await interaction.response.send_message(
-            "Dieser Befehl ist auf den Bot-Owner beschränkt.", ephemeral=True
-        )
-        return
-
-    if datei.size > _MAX_CHARACTER_UPLOAD_BYTES:
-        await interaction.response.send_message(
-            f"Datei zu groß ({datei.size / 1024:.0f} KB, Limit "
-            f"{_MAX_CHARACTER_UPLOAD_BYTES // 1024} KB). Nichts wurde verändert.",
-            ephemeral=True,
-        )
-        return
-
-    raw = await datei.read()
-    try:
-        html = raw.decode("utf-8")
-    except UnicodeDecodeError as e:
-        await interaction.response.send_message(
-            f"Datei ist kein gültiges UTF-8-Text/HTML ({e}). Nichts wurde verändert.",
-            ephemeral=True,
-        )
-        return
-
-    # Validierung VOR jedem Dateizugriff — die bestehende, funktionierende
-    # Datei bleibt bei einer fehlgeschlagenen Validierung unangetastet.
-    try:
-        character_list.parse_characters_html(html)
-    except character_list.CharacterParseError as e:
-        await interaction.response.send_message(
-            f"Datei konnte nicht geparst werden, bestehende Charakterliste bleibt "
-            f"unverändert: {e}",
-            ephemeral=True,
-        )
-        return
-
-    character_list.save_local_html(html)
-
-    try:
-        characters = character_list.get_characters(force_refresh=True)
-    except character_list.CharacterDataUnavailableError as e:
-        # Sollte nach einer erfolgreichen Validierung+Speicherung praktisch
-        # nie auftreten — Absicherung gegen unerwartete I/O-Fehler zwischen
-        # save_local_html() und dem erneuten Einlesen.
-        await interaction.response.send_message(
-            f"Datei gespeichert, aber erneutes Einlesen ist fehlgeschlagen: {e}",
-            ephemeral=True,
-        )
-        return
-
-    _set_character_names(characters)
-    await interaction.response.send_message(
-        f"Charakterliste aktualisiert: {len(characters)} Charaktere geladen, "
-        f"sofort für Autocomplete aktiv.",
-        ephemeral=True,
-    )
-
-
 # ── /tw_celebrate ─────────────────────────────────────────────────────────
 
 
@@ -1291,9 +1228,6 @@ async def tw_help(interaction: discord.Interaction):
         "Nachricht @mentionen und die Frage direkt dranschreiben.",
         "**`/tw_delete verteidiger angreifer`** — *Manager/Admin*\n"
         "Löscht einen Konter samt aller Reports, nach Bestätigung.",
-        "**`/tw_characterrefresh datei`** — *Owner*\n"
-        "Lädt eine manuell gespeicherte Kopie von swgoh.gg/characters/ hoch und "
-        "aktualisiert die Autocomplete-Daten sofort.",
         "**`/tw_celebrate`** — *alle*\n"
         "Zeigt die Top 3 Melder der meisten TW-Reports.",
         "**`/tw_help`** — Zeigt diese Übersicht.",
@@ -1344,51 +1278,12 @@ async def tw_help(interaction: discord.Interaction):
         await interaction.followup.send(extra, ephemeral=True)
 
 
-# ── Wöchentlicher Charakter-Refresh ───────────────────────────────────────
-
-
-@tasks.loop(hours=168)
-async def refresh_characters_task():
-    try:
-        characters = character_list.get_characters(force_refresh=True)
-        _set_character_names(characters)
-        logger.info(
-            "Wöchentlicher Charakter-Refresh erfolgreich: %d Charaktere.",
-            len(character_names),
-        )
-    except character_list.CharacterDataUnavailableError as e:
-        logger.error(
-            "Wöchentlicher Charakter-Refresh fehlgeschlagen UND kein Cache vorhanden: %s "
-            "— Autocomplete bleibt leer bis zum nächsten Versuch.",
-            e,
-        )
-
-
-@refresh_characters_task.before_loop
-async def before_refresh_characters_task():
-    await bot.wait_until_ready()
-
-
 # ── Startup ───────────────────────────────────────────────────────────────
 
 
 @bot.event
 async def on_ready():
     db.init_db()
-
-    try:
-        characters = character_list.get_characters(force_refresh=False)
-        _set_character_names(characters)
-        logger.info("Charakterliste geladen: %d Charaktere.", len(character_names))
-    except character_list.CharacterDataUnavailableError as e:
-        logger.warning(
-            "Keine Charakterdaten verfügbar (%s) — Autocomplete liefert bis zum "
-            "nächsten erfolgreichen Refresh keine Vorschläge.",
-            e,
-        )
-
-    if not refresh_characters_task.is_running():
-        refresh_characters_task.start()
 
     if ROSTER_FEATURE_ENABLED and not refresh_rosters_task.is_running():
         refresh_rosters_task.start()

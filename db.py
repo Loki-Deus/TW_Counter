@@ -585,3 +585,38 @@ def get_owners_of_unit(unit_id: str) -> list[sqlite3.Row]:
             """,
             (unit_id,),
         ).fetchall()
+
+
+def get_owned_unit_display_names() -> list[str]:
+    """
+    Sortierte Liste aller Anzeigenamen, die mindestens ein Gildenmitglied
+    laut letztem Roster-Refresh tatsächlich besitzt -- Ersatz für
+    character_list.py's swgoh.gg-Scrape als Autocomplete-Quelle für
+    /tw_add, /tw_report, /tw_lookup, /tw_zone_attack und /tw_ask (siehe
+    Chat-Verlauf).
+
+    Bewusst NICHT der komplette Comlink-Einheitenkatalog (11000+ Einträge
+    inkl. Raid-Bosse, NPCs, interne/nicht spielbare Einheiten) -- der INNER
+    JOIN auf roster_units filtert automatisch auf tatsächlich besessene
+    Einheiten, weil roster_units by construction nur enthält, was echte
+    Spieler-Roster über comlink tatsächlich geliefert haben.
+
+    Tradeoff, bewusst in Kauf genommen: eine Einheit, die niemand in der
+    Gilde besitzt, taucht hier nicht auf, selbst wenn sie eine legitime
+    spielbare Einheit ist -- in der Praxis meist irrelevant, da ein
+    TW-Konter ohnehin nur für Anführer gemeldet werden kann, die die
+    eigene Gilde tatsächlich einsetzt. Ohne registrierte Gilde oder vor dem
+    ersten Roster-Refresh (siehe /tw_guild_set, /tw_roster_refresh) ist
+    diese Liste leer -- Autocomplete liefert dann keine Vorschläge, kein
+    Absturz.
+    """
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT n.display_name
+            FROM unit_names n
+            JOIN roster_units r ON r.unit_id = n.unit_id
+            ORDER BY n.display_name
+            """
+        ).fetchall()
+        return [row["display_name"] for row in rows]
