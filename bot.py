@@ -369,9 +369,9 @@ def format_lookup_table(
         b = banner_stats.get(attacker)
         if not b or not b["count"]:
             return ""
-        return f"{b['avg']:.1f} (n={b['count']})"
+        return f"{b['avg']:.1f}"
 
-    col_attacker, col_bucket, col_banner = 28, 16, 14
+    col_attacker, col_bucket, col_banner = 28, 15, 8
     header_line = (
         f"{'Angreifer':<{col_attacker}} "
         f"{BUCKET_LABELS['under']:<{col_bucket}} "
