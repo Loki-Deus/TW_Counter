@@ -663,7 +663,7 @@ def format_zone_attack(
     swgoh.gg-Namen trifft); ein Fehltreffer wird als sichtbarer Hinweis
     ausgegeben, nicht stillschweigend als "niemand besitzt das" verwechselt.
 
-    Gibt (messages, overflow_entries) zurück.
+    Gibt (messages, callable_entries) zurück.
 
     messages ist eine Liste, nicht ein einzelner String: bis zu drei
     Verteidiger mit je bis zu drei Angreifern plus vollständiger
@@ -678,12 +678,17 @@ def format_zone_attack(
     Grenzen realistisch weit unter dem Limit, wird also nicht weiter
     aufgesplittet.
 
-    overflow_entries: Liste von (attacker_display_name, unit_id) für jeden
-    Angreifer, dessen Besitzerliste über _ZONE_MAX_MEMBERS hinausgeht
-    ("+X weitere") -- Grundlage für das Dropdown in tw_zone_attack(), über
-    das sich die vollständige Liste abrufen lässt. Per unit_id
+    callable_entries: Liste von (attacker_display_name, unit_id,
+    defender_names, owner_count) für JEDEN Angreifer mit mindestens einem
+    qualifizierenden Besitzer -- Grundlage für das Dropdown in
+    tw_zone_attack(), über das sich für jeden empfohlenen Angreifer (nicht
+    nur die mit gekürzter Inline-Liste) die vollständige Besitzerliste
+    abrufen UND ein "Zum Angriff aufrufen"-Button auslösen lässt. Auch
+    ein nischiger Konter mit nur 1-2 Besitzern landet hier -- gerade bei
+    knappen Fällen ist ein gezielter Aufruf am nützlichsten. Per unit_id
     dedupliziert, falls derselbe Angreifer unter mehreren der genannten
-    Verteidiger auftaucht.
+    Verteidiger auftaucht -- defender_names sammelt dann alle betroffenen
+    Verteidiger, owner_count bleibt der zuerst ermittelte Wert.
     """
     header_lines = [f"## Zonen-Angriff: {zone_name}"]
     if zone_image_url:
@@ -691,7 +696,12 @@ def format_zone_attack(
     header_block = "\n".join(header_lines)
 
     name_to_unit_id = db.get_display_name_to_unit_id_map() if mitgliederliste else {}
-    overflow_by_unit_id: dict[str, str] = {}
+    # Erfasst JEDEN Angreifer mit mindestens einem qualifizierenden
+    # Besitzer, nicht nur die, deren Inline-Liste gekürzt wurde -- ein
+    # "nischiger" Konter mit z.B. nur 2 Besitzern soll genauso aufrufbar
+    # sein wie einer mit 40 (siehe Chat-Verlauf: gerade die knappen Fälle
+    # sind es, bei denen ein gezielter Aufruf am meisten bringt).
+    callable_by_unit_id: dict[str, tuple[str, list[str], int]] = {}
     per_defender_top: dict[str, list[str]] = {}
     defender_blocks: list[str] = []
 
@@ -743,8 +753,17 @@ def format_zone_attack(
                             for o in owners[:_ZONE_MAX_MEMBERS]
                         ]
                         extra = len(owners) - len(labels)
-                        if extra > 0:
-                            overflow_by_unit_id[unit_id] = r["attacker"]
+
+                        # Aufrufbar, sobald es überhaupt einen Besitzer
+                        # gibt -- nicht erst ab Überlauf.
+                        existing = callable_by_unit_id.get(unit_id)
+                        if existing is None:
+                            callable_by_unit_id[unit_id] = (r["attacker"], [verteidiger], len(owners))
+                        else:
+                            _, existing_defenders, _ = existing
+                            if verteidiger not in existing_defenders:
+                                existing_defenders.append(verteidiger)
+
                         suffix = f" (+{extra} weitere)" if extra > 0 else ""
                         line += f"\n  -# Mögliche Angreifer: {', '.join(labels)}{suffix}"
 
@@ -778,39 +797,58 @@ def format_zone_attack(
     if current:
         messages.append("\n\n".join(current))
 
-    overflow_entries = [(name, unit_id) for unit_id, name in overflow_by_unit_id.items()]
-    return messages, overflow_entries
+    callable_entries = [
+        (name, unit_id, defenders, owner_count)
+        for unit_id, (name, defenders, owner_count) in callable_by_unit_id.items()
+    ]
+    return messages, callable_entries
 
 
-class ZoneAttackOverflowSelect(discord.ui.Select):
+class ZoneAttackAttackerSelect(discord.ui.Select):
     """
-    Dropdown zum Abrufen der vollständigen Besitzerliste eines Angreifers,
-    dessen Inline-Liste in der Hauptnachricht auf _ZONE_MAX_MEMBERS gekürzt
-    wurde ("+X weitere"). min_relic_tier MUSS mit dem Wert übereinstimmen,
-    der die Hauptnachricht erzeugt hat (_MIN_RELIC_TIER_FOR_ATTACK zur
-    Aufrufzeit) -- sonst zeigt die vollständige Liste andere Leute als die
-    gekürzte Inline-Liste, was mehr verwirrt als hilft.
+    Dropdown über JEDEN empfohlenen Angreifer einer /tw_zone_attack-
+    Antwort (mitgliederliste=True), nicht nur die mit gekürzter Inline-
+    Liste -- Auswahl zeigt die vollständige Besitzerliste privat (ephemeral)
+    plus einen "Zum Angriff aufrufen"-Button. min_relic_tier MUSS mit dem
+    Wert übereinstimmen, der die Hauptnachricht erzeugt hat
+    (_MIN_RELIC_TIER_FOR_ATTACK zur Aufrufzeit) -- sonst zeigt die
+    vollständige Liste andere Leute als die (falls vorhandene) gekürzte
+    Inline-Liste, was mehr verwirrt als hilft.
 
     Antwort ephemeral: nur der Klickende sieht die vollständige Liste,
-    keine Kanal-Nachricht mit potenziell 30+ Namen.
+    keine Kanal-Nachricht mit potenziell 30+ Namen. Trägt zusätzlich den
+    "Zum Angriff aufrufen"-Button (ZoneAttackCallButton), über den genau
+    diese Person die Liste dann bewusst öffentlich machen kann -- die
+    Sichtung (ephemeral) und die Entscheidung, tatsächlich zu pingen
+    (öffentlich), sind zwei getrennte Schritte, kein Automatismus.
     """
 
-    def __init__(self, overflow_entries: list[tuple[str, str]], min_relic_tier: int):
+    def __init__(
+        self,
+        zone_name: str,
+        callable_entries: list[tuple[str, str, list[str], int]],
+        min_relic_tier: int,
+    ):
+        self._zone_name = zone_name
         self._min_relic_tier = min_relic_tier
         # Discord erlaubt maximal 25 Optionen pro Select -- bei mehr als 25
-        # überfüllten Angreifern (unrealistisch bei _ZONE_TOP_N=3 und bis
-        # zu 3 Verteidigern, aber zur Sicherheit) werden die restlichen
-        # schlicht nicht anwählbar, statt einen Fehler zu werfen.
-        limited = overflow_entries[:25]
-        self._by_value = {str(i): (name, unit_id) for i, (name, unit_id) in enumerate(limited)}
+        # aufrufbaren Angreifern (unrealistisch bei _ZONE_TOP_N=3 und bis
+        # zu 3 Verteidigern -> max. 9, aber zur Sicherheit) werden die
+        # restlichen schlicht nicht anwählbar, statt einen Fehler zu werfen.
+        limited = callable_entries[:25]
+        self._by_value = {str(i): entry for i, entry in enumerate(limited)}
         options = [
-            discord.SelectOption(label=name[:100], value=value)
-            for value, (name, _) in self._by_value.items()
+            discord.SelectOption(
+                label=name[:100],
+                value=value,
+                description=f"{owner_count} Besitzer",
+            )
+            for value, (name, _, _, owner_count) in self._by_value.items()
         ]
-        super().__init__(placeholder="Vollständige Liste anzeigen für...", options=options)
+        super().__init__(placeholder="Angreifer für Aufruf auswählen...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        name, unit_id = self._by_value[self.values[0]]
+        name, unit_id, defender_names, _ = self._by_value[self.values[0]]
         owners = db.get_owners_of_unit(unit_id, min_relic_tier=self._min_relic_tier)
         labels = [
             f"<@{o['discord_id']}>" if o["discord_id"] else o["player_name"] for o in owners
@@ -818,13 +856,20 @@ class ZoneAttackOverflowSelect(discord.ui.Select):
         header = f"**Alle möglichen Angreifer für {name}** ({len(owners)}):\n"
         body = ", ".join(labels)
 
+        call_view = ZoneAttackCallView(
+            self._zone_name, name, unit_id, defender_names, self._min_relic_tier
+        )
+
         if len(header) + len(body) <= 2000:
-            await interaction.response.send_message(header + body, ephemeral=True)
+            await interaction.response.send_message(
+                header + body, view=call_view, ephemeral=True
+            )
             return
 
         # Zu lang für eine einzelne Nachricht -- in Chunks aufteilen, statt
-        # abzuschneiden oder zu crashen.
-        await interaction.response.send_message(header, ephemeral=True)
+        # abzuschneiden oder zu crashen. Der Aufruf-Button hängt am Kopf-
+        # Chunk, nicht an jedem einzelnen Folge-Chunk.
+        await interaction.response.send_message(header, view=call_view, ephemeral=True)
         chunk = ""
         for label in labels:
             addition = (", " if chunk else "") + label
@@ -837,15 +882,102 @@ class ZoneAttackOverflowSelect(discord.ui.Select):
             await interaction.followup.send(chunk, ephemeral=True)
 
 
-class ZoneAttackView(discord.ui.View):
-    """Enthält das Overflow-Dropdown NUR, wenn es überhaupt gekürzte Listen
-    gibt -- kein leeres, nutzloses Menü, wenn alle Besitzerlisten schon
-    vollständig inline passen."""
+class ZoneAttackCallButton(discord.ui.Button):
+    """
+    Macht aus einer privat gesichteten Besitzerliste einen tatsächlichen,
+    für alle sichtbaren Angriffsaufruf mit echten Pings. Holt die
+    Besitzerliste beim Klick NEU (statt die zuvor im Dropdown gezeigte
+    Liste zu cachen) -- zwischen Sichtung und Klick können Sekunden bis
+    Minuten liegen, in denen sich am Roster nichts Wesentliches ändert,
+    aber es kostet nichts, hier konsistent zu sein statt zu vertrauen, dass
+    sich nichts geändert hat.
+    """
 
-    def __init__(self, overflow_entries: list[tuple[str, str]], min_relic_tier: int):
+    def __init__(
+        self,
+        zone_name: str,
+        attacker_name: str,
+        unit_id: str,
+        defender_names: list[str],
+        min_relic_tier: int,
+    ):
+        super().__init__(label="Zum Angriff aufrufen", style=discord.ButtonStyle.danger)
+        self._zone_name = zone_name
+        self._attacker_name = attacker_name
+        self._unit_id = unit_id
+        self._defender_names = defender_names
+        self._min_relic_tier = min_relic_tier
+
+    async def callback(self, interaction: discord.Interaction):
+        owners = db.get_owners_of_unit(self._unit_id, min_relic_tier=self._min_relic_tier)
+        mentions = [
+            f"<@{o['discord_id']}>" if o["discord_id"] else o["player_name"] for o in owners
+        ]
+        defender_text = " / ".join(self._defender_names) if self._defender_names else "?"
+        header = (
+            f"📣 **Angriffsaufruf — {self._zone_name}**\n"
+            f"Gegen **{defender_text}**: bringt **{self._attacker_name}**!\n"
+        )
+        body = " ".join(mentions)
+
+        # Button in der ephemeralen Nachricht deaktivieren und beschriften
+        # -- macht sichtbar, dass der Aufruf bereits raus ist, ohne ein
+        # zweites Klicken technisch zu verhindern (das würde nur denselben
+        # Aufruf wiederholen, kein Datenrisiko).
+        self.disabled = True
+        self.label = "Aufruf gesendet ✅"
+        await interaction.response.edit_message(view=self.view)
+
+        full = header + body
+        if len(full) <= 2000:
+            await interaction.followup.send(full, ephemeral=False)
+            return
+
+        await interaction.followup.send(header, ephemeral=False)
+        chunk = ""
+        for mention in mentions:
+            addition = (" " if chunk else "") + mention
+            if len(chunk) + len(addition) > 1900:
+                await interaction.followup.send(chunk, ephemeral=False)
+                chunk = mention
+            else:
+                chunk += addition
+        if chunk:
+            await interaction.followup.send(chunk, ephemeral=False)
+
+
+class ZoneAttackCallView(discord.ui.View):
+    """View mit genau einem "Zum Angriff aufrufen"-Button, gebunden an
+    einen konkreten Angreifer/Verteidiger-Kontext."""
+
+    def __init__(
+        self,
+        zone_name: str,
+        attacker_name: str,
+        unit_id: str,
+        defender_names: list[str],
+        min_relic_tier: int,
+    ):
         super().__init__(timeout=300)
-        if overflow_entries:
-            self.add_item(ZoneAttackOverflowSelect(overflow_entries, min_relic_tier))
+        self.add_item(
+            ZoneAttackCallButton(zone_name, attacker_name, unit_id, defender_names, min_relic_tier)
+        )
+
+
+class ZoneAttackView(discord.ui.View):
+    """Enthält das Angreifer-Dropdown NUR, wenn es überhaupt einen
+    aufrufbaren Angreifer gibt (mindestens ein qualifizierender Besitzer
+    irgendwo) -- kein leeres, nutzloses Menü, wenn niemand etwas besitzt."""
+
+    def __init__(
+        self,
+        zone_name: str,
+        callable_entries: list[tuple[str, str, list[str], int]],
+        min_relic_tier: int,
+    ):
+        super().__init__(timeout=300)
+        if callable_entries:
+            self.add_item(ZoneAttackAttackerSelect(zone_name, callable_entries, min_relic_tier))
 
 
 @tree.command(
@@ -884,10 +1016,14 @@ async def tw_zone_attack(
 
     verteidiger_liste = [v for v in (verteidiger_1, verteidiger_2, verteidiger_3) if v]
 
-    messages, overflow_entries = format_zone_attack(
+    messages, callable_entries = format_zone_attack(
         zone_row["name"], zone_row["image_url"], verteidiger_liste, mitgliederliste
     )
-    view = ZoneAttackView(overflow_entries, _MIN_RELIC_TIER_FOR_ATTACK) if overflow_entries else None
+    view = (
+        ZoneAttackView(zone_row["name"], callable_entries, _MIN_RELIC_TIER_FOR_ATTACK)
+        if callable_entries
+        else None
+    )
 
     # Das Dropdown (falls vorhanden) hängt NUR an der letzten Nachricht --
     # Discord erlaubt Components pro Nachricht, nicht "für die ganze
