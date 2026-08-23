@@ -60,6 +60,7 @@ funktioniert, wenn das Feld beim Ausfüllen bereits gesetzt ist.
 """
 
 import logging
+import math
 from collections import Counter
 
 import discord
@@ -230,13 +231,39 @@ def _aggregate_bucket_stats(attackers: list[str], bucket_rows: list) -> dict:
     return stats
 
 
+def _wilson_lower_bound(wins: int, losses: int, z: float = 1.96) -> float:
+    """
+    Untere Grenze des Wilson-Score-Konfidenzintervalls -- Sortiergrundlage
+    statt der rohen Gewinnquote (siehe Chat-Verlauf: eine 1/1-Quote landete
+    zuvor gleichrangig mit einer 15/15-Quote, weil beide "100%" zeigten,
+    und schlug sogar eine echte 9/10-Quote von 90% -- die Rohquote allein
+    ignoriert Stichprobengröße komplett). z=1.96 entspricht einem
+    95%-Konfidenzniveau, der übliche Standardwert für dieses Verfahren.
+
+    Verifiziert gegen die realen Zahlen aus dem Third-Sister-Beispiel im
+    Chat-Verlauf: Darth Bane (15/0) bleibt vorn, aber Hera Syndulla (15/2)
+    und Bo-Katan (9/1) überholen jetzt korrekt die 1/1-Einträge, statt von
+    ihnen wegen höherer Rohquote verdrängt zu werden.
+    """
+    n = wins + losses
+    if n == 0:
+        return 0.0
+    phat = wins / n
+    z2 = z * z
+    denom = 1 + z2 / n
+    center = phat + z2 / (2 * n)
+    margin = z * math.sqrt((phat * (1 - phat) + z2 / (4 * n)) / n)
+    return (center - margin) / denom
+
+
 def _even_sort_key(attacker: str, stats: dict) -> tuple[bool, float]:
-    """Ausgeglichen-Quote als Sortierschlüssel; Konter ohne Daten in diesem
-    Bucket sinken ans Ende (siehe Aufrufer für die Sortierrichtung)."""
+    """Wilson-Score der Ausgeglichen-Quote als Sortierschlüssel (siehe
+    _wilson_lower_bound()); Konter ohne Daten in diesem Bucket sinken ans
+    Ende (siehe Aufrufer für die Sortierrichtung)."""
     wins = stats[attacker]["even"]["wins"]
     losses = stats[attacker]["even"]["losses"]
     total = wins + losses
-    return (total > 0, (wins / total) if total > 0 else 0.0)
+    return (total > 0, _wilson_lower_bound(wins, losses) if total > 0 else 0.0)
 
 
 def _aggregate_banner_stats(banner_rows: list) -> dict:

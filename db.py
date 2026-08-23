@@ -558,10 +558,44 @@ def get_display_name_to_unit_id_map() -> dict[str, str]:
     umgekehrt. Ein leeres Dict, solange nie ein Refresh gelaufen ist --
     kein Fehler, der Aufrufer muss das ohnehin pro Angreifer einzeln
     behandeln (siehe bot.py).
+
+    KORRIGIERT (siehe Chat-Verlauf): frühere Version baute das Dict direkt
+    aus SELECT unit_id, display_name FROM unit_names -- das ignorierte,
+    dass comlinks Rohkatalog für praktisch jeden Charakter ein Dutzend+
+    Nicht-Spieler-Varianten mit demselben Anzeigenamen enthält
+    (Stern-Stufen-Encounter-Previews wie "GENERALSKYWALKER:ONE_STAR" bis
+    "SEVEN_STAR", Raid-/TB-Boss-Formen wie "PVE_GENERALSKYWALKER:*",
+    GLE-Inherit-Event-Varianten etc. -- 660 von 11000+ Anzeigenamen
+    betroffen, live gegen die eigene DB geprüft). Ein simples dict-
+    comprehension übernahm irgendeine dieser IDs, je nach SQL-Ergebnis-
+    reihenfolge effektiv zufällig -- bei "General Skywalker" traf es NICHT
+    die echte, von 45 Gildenmitgliedern besessene ID (GENERALSKYWALKER),
+    sondern eine Nicht-Spieler-Variante, wodurch /tw_zone_attack
+    fälschlich "niemand besitzt das" meldete.
+
+    Jetzt: pro Anzeigename wird die unit_id gewählt, die in roster_units
+    tatsächlich von den meisten Spielern besessen wird. Nicht-Spieler-
+    Varianten haben per Definition NIE echte Roster-Einträge (kein Spieler
+    "besitzt" einen Raid-Boss oder eine Encounter-Preview), fallen also
+    über den INNER JOIN automatisch heraus, nicht nur zufällig manchmal.
     """
     with get_connection() as conn:
-        rows = conn.execute("SELECT unit_id, display_name FROM unit_names").fetchall()
-        return {row["display_name"]: row["unit_id"] for row in rows}
+        rows = conn.execute(
+            """
+            SELECT n.display_name, r.unit_id, COUNT(DISTINCT r.ally_code) AS owner_count
+            FROM unit_names n
+            JOIN roster_units r ON r.unit_id = n.unit_id
+            GROUP BY n.display_name, r.unit_id
+            ORDER BY n.display_name, owner_count DESC
+            """
+        ).fetchall()
+        result: dict[str, str] = {}
+        for row in rows:
+            # Erste Zeile pro display_name (dank ORDER BY owner_count DESC)
+            # hat die meisten Besitzer -- setdefault() ignoriert alle
+            # weiteren Zeilen für denselben Namen.
+            result.setdefault(row["display_name"], row["unit_id"])
+        return result
 
 
 def get_owners_of_unit(unit_id: str, min_relic_tier: int = 0) -> list[sqlite3.Row]:
