@@ -642,7 +642,7 @@ _ZONE_MAX_MEMBERS = 5
 # die offizielle relicTierDefinition-Tabelle UND einen echten Live-
 # Datenpunkt (siehe dortiger Kommentar). Um den Schwellwert zu ändern,
 # NUR diese Zahl anpassen, nicht den Rohwert von Hand ausrechnen.
-_MIN_DISPLAY_RELIC_FOR_ATTACK = 1
+_MIN_DISPLAY_RELIC_FOR_ATTACK = 7
 _MIN_RELIC_TIER_FOR_ATTACK = config.display_relic_to_raw(_MIN_DISPLAY_RELIC_FOR_ATTACK)
 
 
@@ -651,7 +651,7 @@ def format_zone_attack(
     zone_image_url: str | None,
     verteidiger_liste: list[str],
     mitgliederliste: bool,
-) -> str:
+) -> tuple[list[str], list[tuple[str, str]]]:
     """
     Reine Funktion ohne discord.Interaction-Abhängigkeit, wie format_lookup_table.
 
@@ -662,24 +662,47 @@ def format_zone_attack(
     -- unverifiziert, ob comlinks Lokalisierung exakt character_list.py's
     swgoh.gg-Namen trifft); ein Fehltreffer wird als sichtbarer Hinweis
     ausgegeben, nicht stillschweigend als "niemand besitzt das" verwechselt.
+
+    Gibt (messages, overflow_entries) zurück.
+
+    messages ist eine Liste, nicht ein einzelner String: bis zu drei
+    Verteidiger mit je bis zu drei Angreifern plus vollständiger
+    Mitgliederliste kommen in der Praxis nah an Discords harte
+    2000-Zeichen-Grenze pro Nachricht heran (ein realistischer Testfall lag
+    bei ~1843 Zeichen -- ein einziger etwas längerer Anführername, ein
+    "keine Zuordnung"-Hinweis statt einer kurzen Mitgliederliste, oder ein
+    Zonen-Bild reichen, um drüber zu rutschen). Wird deshalb wie /tw_lookup
+    und /tw_help in mehrere Nachrichten aufgeteilt (_DISCORD_MESSAGE_LIMIT),
+    pro Verteidiger als kleinste unteilbare Einheit -- ein einzelner
+    Verteidiger-Block bleibt bei aktuellen _ZONE_TOP_N/_ZONE_MAX_MEMBERS-
+    Grenzen realistisch weit unter dem Limit, wird also nicht weiter
+    aufgesplittet.
+
+    overflow_entries: Liste von (attacker_display_name, unit_id) für jeden
+    Angreifer, dessen Besitzerliste über _ZONE_MAX_MEMBERS hinausgeht
+    ("+X weitere") -- Grundlage für das Dropdown in tw_zone_attack(), über
+    das sich die vollständige Liste abrufen lässt. Per unit_id
+    dedupliziert, falls derselbe Angreifer unter mehreren der genannten
+    Verteidiger auftaucht.
     """
-    lines = [f"## Zonen-Angriff: {zone_name}"]
+    header_lines = [f"## Zonen-Angriff: {zone_name}"]
     if zone_image_url:
-        lines.append(zone_image_url)  # Discord rendert eine alleinstehende Bild-URL als Vorschau
-    lines.append("")
+        header_lines.append(zone_image_url)  # Discord rendert eine alleinstehende Bild-URL als Vorschau
+    header_block = "\n".join(header_lines)
 
     name_to_unit_id = db.get_display_name_to_unit_id_map() if mitgliederliste else {}
-
+    overflow_by_unit_id: dict[str, str] = {}
     per_defender_top: dict[str, list[str]] = {}
+    defender_blocks: list[str] = []
 
     for verteidiger in verteidiger_liste:
         ranked = rank_attackers(verteidiger)
-        lines.append(f"**Gegen {verteidiger}:**")
+        block_lines = [f"**Gegen {verteidiger}:**"]
 
         if not ranked:
-            lines.append("Keine Konter hinterlegt.")
+            block_lines.append("Keine Konter hinterlegt.")
             per_defender_top[verteidiger] = []
-            lines.append("")
+            defender_blocks.append("\n".join(block_lines))
             continue
 
         top = ranked[:_ZONE_TOP_N]
@@ -720,24 +743,109 @@ def format_zone_attack(
                             for o in owners[:_ZONE_MAX_MEMBERS]
                         ]
                         extra = len(owners) - len(labels)
+                        if extra > 0:
+                            overflow_by_unit_id[unit_id] = r["attacker"]
                         suffix = f" (+{extra} weitere)" if extra > 0 else ""
-                        line += f"\n  -# Kann besetzt werden von: {', '.join(labels)}{suffix}"
+                        line += f"\n  -# Mögliche Angreifer: {', '.join(labels)}{suffix}"
 
-            lines.append(line)
-        lines.append("")
+            block_lines.append(line)
+        defender_blocks.append("\n".join(block_lines))
 
+    hedge_block = None
     if len(verteidiger_liste) > 1:
         counts = Counter(
             attacker for tops in per_defender_top.values() for attacker in tops
         )
         hedges = sorted(a for a, c in counts.items() if c > 1)
         if hedges:
-            lines.append(
+            hedge_block = (
                 f"**Hedge (deckt mehrere der genannten Verteidiger ab):** {', '.join(hedges)}"
             )
-            lines.append("")
 
-    return "\n".join(lines)
+    all_blocks = [header_block] + defender_blocks + ([hedge_block] if hedge_block else [])
+
+    messages: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for block in all_blocks:
+        block_len = len(block) + 2  # "\n\n"-Trenner beim Zusammenfügen
+        if current and current_len + block_len > _DISCORD_MESSAGE_LIMIT:
+            messages.append("\n\n".join(current))
+            current = []
+            current_len = 0
+        current.append(block)
+        current_len += block_len
+    if current:
+        messages.append("\n\n".join(current))
+
+    overflow_entries = [(name, unit_id) for unit_id, name in overflow_by_unit_id.items()]
+    return messages, overflow_entries
+
+
+class ZoneAttackOverflowSelect(discord.ui.Select):
+    """
+    Dropdown zum Abrufen der vollständigen Besitzerliste eines Angreifers,
+    dessen Inline-Liste in der Hauptnachricht auf _ZONE_MAX_MEMBERS gekürzt
+    wurde ("+X weitere"). min_relic_tier MUSS mit dem Wert übereinstimmen,
+    der die Hauptnachricht erzeugt hat (_MIN_RELIC_TIER_FOR_ATTACK zur
+    Aufrufzeit) -- sonst zeigt die vollständige Liste andere Leute als die
+    gekürzte Inline-Liste, was mehr verwirrt als hilft.
+
+    Antwort ephemeral: nur der Klickende sieht die vollständige Liste,
+    keine Kanal-Nachricht mit potenziell 30+ Namen.
+    """
+
+    def __init__(self, overflow_entries: list[tuple[str, str]], min_relic_tier: int):
+        self._min_relic_tier = min_relic_tier
+        # Discord erlaubt maximal 25 Optionen pro Select -- bei mehr als 25
+        # überfüllten Angreifern (unrealistisch bei _ZONE_TOP_N=3 und bis
+        # zu 3 Verteidigern, aber zur Sicherheit) werden die restlichen
+        # schlicht nicht anwählbar, statt einen Fehler zu werfen.
+        limited = overflow_entries[:25]
+        self._by_value = {str(i): (name, unit_id) for i, (name, unit_id) in enumerate(limited)}
+        options = [
+            discord.SelectOption(label=name[:100], value=value)
+            for value, (name, _) in self._by_value.items()
+        ]
+        super().__init__(placeholder="Vollständige Liste anzeigen für...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        name, unit_id = self._by_value[self.values[0]]
+        owners = db.get_owners_of_unit(unit_id, min_relic_tier=self._min_relic_tier)
+        labels = [
+            f"<@{o['discord_id']}>" if o["discord_id"] else o["player_name"] for o in owners
+        ]
+        header = f"**Alle möglichen Angreifer für {name}** ({len(owners)}):\n"
+        body = ", ".join(labels)
+
+        if len(header) + len(body) <= 2000:
+            await interaction.response.send_message(header + body, ephemeral=True)
+            return
+
+        # Zu lang für eine einzelne Nachricht -- in Chunks aufteilen, statt
+        # abzuschneiden oder zu crashen.
+        await interaction.response.send_message(header, ephemeral=True)
+        chunk = ""
+        for label in labels:
+            addition = (", " if chunk else "") + label
+            if len(chunk) + len(addition) > 1900:
+                await interaction.followup.send(chunk, ephemeral=True)
+                chunk = label
+            else:
+                chunk += addition
+        if chunk:
+            await interaction.followup.send(chunk, ephemeral=True)
+
+
+class ZoneAttackView(discord.ui.View):
+    """Enthält das Overflow-Dropdown NUR, wenn es überhaupt gekürzte Listen
+    gibt -- kein leeres, nutzloses Menü, wenn alle Besitzerlisten schon
+    vollständig inline passen."""
+
+    def __init__(self, overflow_entries: list[tuple[str, str]], min_relic_tier: int):
+        super().__init__(timeout=300)
+        if overflow_entries:
+            self.add_item(ZoneAttackOverflowSelect(overflow_entries, min_relic_tier))
 
 
 @tree.command(
@@ -776,10 +884,18 @@ async def tw_zone_attack(
 
     verteidiger_liste = [v for v in (verteidiger_1, verteidiger_2, verteidiger_3) if v]
 
-    text = format_zone_attack(
+    messages, overflow_entries = format_zone_attack(
         zone_row["name"], zone_row["image_url"], verteidiger_liste, mitgliederliste
     )
-    await interaction.response.send_message(text)
+    view = ZoneAttackView(overflow_entries, _MIN_RELIC_TIER_FOR_ATTACK) if overflow_entries else None
+
+    # Das Dropdown (falls vorhanden) hängt NUR an der letzten Nachricht --
+    # Discord erlaubt Components pro Nachricht, nicht "für die ganze
+    # Antwort", und die letzte Nachricht ist die sinnvollste Stelle dafür.
+    await interaction.response.send_message(messages[0], view=view if len(messages) == 1 else discord.utils.MISSING)
+    for i, extra in enumerate(messages[1:], start=2):
+        is_last = i == len(messages)
+        await interaction.followup.send(extra, view=view if is_last else discord.utils.MISSING)
 
 
 tw_zone_attack.autocomplete("zone")(zone_autocomplete)
