@@ -68,6 +68,7 @@ Diese Brücke (vermutlich über Comlinks /data-Endpunkt, der defId ->
 Anzeigename mitliefert) ist ein eigener, noch offener Arbeitsschritt.
 """
 
+import asyncio
 import logging
 
 from swgoh_comlink import SwgohComlinkAsync
@@ -308,6 +309,24 @@ async def fetch_unit_names(locale: str = "ENG_US") -> dict[str, str]:
         raise RosterFetchError(str(e)) from e
 
     raw_text = loc.get(f"Loc_{locale}.txt", "")
+
+    # Beides in Worker-Threads statt direkt hier synchron auszuführen --
+    # das Parsen von ~12,5 MB Text zu ~70.000 Einträgen UND das
+    # anschließende Durchlaufen von ~11.000 Einheiten sind reine CPU-Arbeit
+    # ohne await dazwischen. Direkt im Event-Loop ausgeführt, blockiert das
+    # den gesamten Bot für die Dauer des Parsens -- keine andere Discord-
+    # Interaction kann in dieser Zeit bedient werden. Genau das hat einmal
+    # einen parallelen /tw_lookup-Aufruf an Discords 3-Sekunden-
+    # Antwortfenster vorbeirauschen lassen (siehe Chat-Verlauf,
+    # "Unknown interaction"-Fehler trotz an sich schnellem Command).
+    loc_map = await asyncio.to_thread(_parse_localization_text, raw_text)
+    return await asyncio.to_thread(_build_unit_name_map, units, loc_map)
+
+
+def _parse_localization_text(raw_text: str) -> dict[str, str]:
+    """Reine, synchrone Funktion -- bewusst von fetch_unit_names()
+    getrennt, damit sie via asyncio.to_thread() in einem Worker-Thread
+    laufen kann (siehe dortiger Kommentar)."""
     loc_map: dict[str, str] = {}
     for line in raw_text.split("\n"):
         if not line or line.startswith("#"):
@@ -315,7 +334,12 @@ async def fetch_unit_names(locale: str = "ENG_US") -> dict[str, str]:
         parts = line.split("|", 1)
         if len(parts) == 2:
             loc_map[parts[0]] = parts[1]
+    return loc_map
 
+
+def _build_unit_name_map(units: list[dict], loc_map: dict[str, str]) -> dict[str, str]:
+    """Reine, synchrone Funktion -- ebenfalls für asyncio.to_thread()
+    ausgelagert, siehe fetch_unit_names()."""
     names: dict[str, str] = {}
     for unit in units:
         unit_id = unit.get("id")
@@ -325,5 +349,4 @@ async def fetch_unit_names(locale: str = "ENG_US") -> dict[str, str]:
         display_name = loc_map.get(name_key)
         if display_name:
             names[unit_id] = display_name
-
     return names

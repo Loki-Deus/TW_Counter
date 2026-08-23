@@ -59,6 +59,7 @@ angreifer-Autocomplete interaction.namespace.verteidiger liest und damit nur
 funktioniert, wenn das Feld beim Ausfüllen bereits gesetzt ist.
 """
 
+import asyncio
 import logging
 import math
 from collections import Counter
@@ -906,7 +907,7 @@ if ROSTER_FEATURE_ENABLED:
             return
 
         db.upsert_player(resolved_ally_code, player_name)
-        db.save_roster(resolved_ally_code, player_name, units)
+        await asyncio.to_thread(db.save_roster, resolved_ally_code, player_name, units)
         db.link_discord_id(resolved_ally_code, str(interaction.user.id))
 
         await interaction.followup.send(
@@ -979,7 +980,7 @@ if ROSTER_FEATURE_ENABLED:
                     player_id=player_id
                 )
                 db.upsert_player(ally_code, player_name)
-                db.save_roster(ally_code, player_name, units)
+                await asyncio.to_thread(db.save_roster, ally_code, player_name, units)
                 updated += 1
             except (roster.AllyCodeNotFoundError, roster.RosterFetchError) as e:
                 logger.warning(
@@ -1017,7 +1018,11 @@ if ROSTER_FEATURE_ENABLED:
         except roster.RosterFetchError as e:
             logger.warning("unit_names-Refresh fehlgeschlagen: %s", e)
             return
-        db.save_unit_names(names)
+        # asyncio.to_thread(): mehrere tausend INSERTs synchron im Event-
+        # Loop würden denselben Blockier-Effekt haben wie das Parsen in
+        # roster.fetch_unit_names() (siehe dortiger Kommentar) -- diese
+        # Zeile war Teil desselben "Unknown interaction"-Vorfalls.
+        await asyncio.to_thread(db.save_unit_names, names)
         logger.info("unit_names-Refresh abgeschlossen: %d Einheiten.", len(names))
 
     @refresh_unit_names_task.before_loop
