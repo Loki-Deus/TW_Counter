@@ -40,13 +40,15 @@ ohne eine Zahl mitpflegen zu müssen.
 
 Berechtigungsmodell: zwei unabhängige Rollen ohne Administrator-Override.
 SPECIALIST_ROLE_ID gate für /tw_add und /tw_zone_add (Katalogpflege),
-MEMBER_ROLE_ID für /tw_report (und, sobald aktiviert, /tw_register --
-beides Selbstbedienung für Mitglieder). /tw_delete und /tw_zone_attack
+MEMBER_ROLE_ID für /tw_report. /tw_register ist bewusst für ALLE offen,
+nicht nur MEMBER_ROLE_ID -- reine Selbstauskunft (den eigenen Ally-Code
+verknüpfen) ohne Schreibzugriff auf Konter-/Report-Daten, verträgt eine
+niedrigere Hürde als tatsächliches Reporten. /tw_delete und /tw_zone_attack
 erfordern Administrator ODER Mitgliedschaft in MANAGER_IDS --
 /tw_zone_attack, weil es eine taktische Kriegsnacht-Entscheidung ist statt
-Katalogpflege. /tw_roster_refresh (deaktiviert) würde aus demselben Grund
-ebenfalls Manager-Rechte erfordern: echte Netzwerklast auf der eigenen
-comlink-Instanz, kein Selbstbedienungs-Command wie /tw_register.
+Katalogpflege. /tw_roster_refresh erfordert aus demselben Grund ebenfalls
+Manager-Rechte: echte Netzwerklast auf der eigenen comlink-Instanz, kein
+Selbstbedienungs-Command wie /tw_register.
 /tw_lookup, /tw_ask, /tw_celebrate und /tw_help sind für alle offen.
 
 Natürlichsprachliche Anfragen laufen über zwei Trigger auf denselben
@@ -1129,13 +1131,10 @@ if ROSTER_FEATURE_ENABLED:
     )
     @app_commands.describe(ally_code="Dein Ally-Code, z.B. 123456789 oder 123-456-789")
     async def tw_register(interaction: discord.Interaction, ally_code: str):
-        if not is_member(interaction):
-            await interaction.response.send_message(
-                "Dieser Befehl ist auf die Rolle der Report-berechtigten Mitglieder beschränkt.",
-                ephemeral=True,
-            )
-            return
-
+        # Bewusst offen für alle, keine Rollenprüfung (anders als
+        # /tw_report) -- Verknüpfen des eigenen Ally-Codes ist reine
+        # Selbstauskunft ohne Schreibzugriff auf Konter-/Report-Daten,
+        # verträgt also eine niedrigere Hürde als tatsächliches Reporten.
         try:
             normalized = roster.normalize_ally_code(ally_code)
         except ValueError as e:
@@ -1550,7 +1549,7 @@ async def tw_help(interaction: discord.Interaction):
         )
         sections.insert(
             7,
-            "**`/tw_register ally_code`** — *Mitglieder-Rolle*\n"
+            "**`/tw_register ally_code`** — *alle*\n"
             "Verknüpft deinen Discord-Account mit deinem (bereits bekannten) Ally-Code -- "
             "kein manuelles Signup nötig, damit dein Roster erfasst wird, nur um ihn dir "
             "als Discord-Nutzer zuzuordnen.",
