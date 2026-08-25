@@ -720,25 +720,47 @@ def get_owned_unit_display_names() -> list[str]:
 def delete_players_not_in(player_ids: list[str]) -> int:
     """
     Entfernt alle players-Zeilen (und per CASCADE ihre roster_units),
-    deren player_id gesetzt ist, aber NICHT mehr in `player_ids`
-    auftaucht -- echte Gilden-Abgänge, bestätigt durch Abwesenheit in der
-    autoritativen comlink-Mitgliederliste selbst (roster.fetch_guild_members()),
-    NICHT durch einen fehlgeschlagenen Einzel-Fetch für diesen Spieler
-    (der könnte transient sein -- ein Netzwerk-Hänger beim Abrufen EINES
+    deren player_id NICHT (mehr) in `player_ids` auftaucht -- echte
+    Gilden-Abgänge, bestätigt durch Abwesenheit in der autoritativen
+    comlink-Mitgliederliste selbst (roster.fetch_guild_members()), NICHT
+    durch einen fehlgeschlagenen Einzel-Fetch für diesen Spieler (der
+    könnte transient sein -- ein Netzwerk-Hänger beim Abrufen EINES
     Spielers heißt nicht, dass er die Gilde verlassen hat).
 
-    Zeilen mit player_id IS NULL (z.B. Registrierungen von vor Einführung
-    dieser Spalte, siehe _migrate_players_add_player_id()) werden NIE
-    automatisch gelöscht -- ohne player_id kann nicht sicher unterschieden
-    werden, ob sie noch Mitglied sind, also lieber gar nichts tun als
-    versehentlich jemanden Aktives entfernen.
+    KORRIGIERT, ECHTER BUG (siehe Chat-Verlauf): frühere Version schloss
+    player_id IS NULL-Zeilen von der Löschung grundsätzlich aus, gedacht
+    als Schutz für ein aktives Mitglied, dessen player_id in GENAU DIESEM
+    Durchlauf noch nicht rückgeschrieben wurde. Tatsächlich bekommt JEDES
+    aktuell aktive, erfolgreich abgefragte Mitglied seine player_id über
+    upsert_player() bereits VOR diesem Aufruf gesetzt (siehe bot.py's
+    _refresh_guild_rosters(): der Verarbeitungs-Loop läuft immer zuerst).
+    Eine Zeile, die HIER TROTZDEM noch player_id IS NULL hat, kann also
+    nur ein Alt-Datensatz von VOR Einführung dieser Spalte sein
+    (_migrate_players_add_player_id()), dessen Spieler die Gilde bereits
+    verlassen hat, BEVOR player_id je erfasst wurde -- so ein Spieler
+    taucht in KEINEM zukünftigen fetch_guild_members()-Ergebnis je wieder
+    auf, seine player_id bliebe unter der alten Logik für immer NULL und
+    er damit für immer unlöschbar. Genau das ist in der Praxis passiert:
+    alte, längst ausgetretene Mitglieder blieben trotz erfolgreich
+    laufendem nächtlichen Refresh dauerhaft in der Liste.
 
-    SICHERHEITSSPERRE: eine leere player_ids-Liste löscht NICHTS und gibt
-    0 zurück, statt "niemand ist mehr Mitglied" zu unterstellen. Eine
-    leere Liste hier bedeutet fast immer einen comlink-Fehler oder einen
-    Bug in fetch_guild_members(), nicht eine tatsächlich leere Gilde --
-    ohne diese Sperre würde ein solcher Fehler die gesamte players-Tabelle
-    leeren, nicht nur nichts tun.
+    Verbleibendes, deutlich engeres Restrisiko: ein Spieler, der aktuell
+    tatsächlich noch Mitglied ist, aber dessen Einzel-Abfrage seit
+    Einführung dieser Spalte bei JEDEM einzelnen Durchlauf fehlgeschlagen
+    ist (nicht nur einmal transient), hätte ebenfalls noch player_id IS
+    NULL und würde jetzt fälschlich als Abgang gewertet. Deutlich enger
+    als der ursprüngliche Bug (der ausnahmslos JEDEN Alt-Geist betraf) und
+    zusätzlich durch die updated>0-Bedingung in
+    bot.py's _refresh_guild_rosters() abgefedert, die diese Bereinigung
+    nur ausführt, wenn der Durchlauf mindestens einen Spieler tatsächlich
+    erfolgreich verarbeitet hat.
+
+    SICHERHEITSSPERRE bleibt: eine leere player_ids-Liste löscht NICHTS
+    und gibt 0 zurück, statt "niemand ist mehr Mitglied" zu unterstellen.
+    Eine leere Liste hier bedeutet fast immer einen comlink-Fehler oder
+    einen Bug in fetch_guild_members(), nicht eine tatsächlich leere
+    Gilde -- ohne diese Sperre würde ein solcher Fehler die gesamte
+    players-Tabelle leeren, nicht nur nichts tun.
     """
     if not player_ids:
         return 0
@@ -747,7 +769,7 @@ def delete_players_not_in(player_ids: list[str]) -> int:
         cur = conn.execute(
             f"""
             DELETE FROM players
-            WHERE player_id IS NOT NULL AND player_id NOT IN ({placeholders})
+            WHERE player_id IS NULL OR player_id NOT IN ({placeholders})
             """,
             player_ids,
         )

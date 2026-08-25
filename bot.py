@@ -1251,7 +1251,14 @@ if ROSTER_FEATURE_ENABLED:
                 )
                 failed += 1
 
-        removed = db.delete_players_not_in(player_ids)
+        # Bereinigung (inkl. NULL-player_id-Altgeister, siehe
+        # db.delete_players_not_in()) nur, wenn dieser Durchlauf
+        # mindestens einen Spieler nachweislich erfolgreich verarbeitet
+        # hat -- zusätzliche Vorsicht gegen den engen Restfall eines
+        # Spielers, dessen Einzel-Abfrage bei JEDEM Durchlauf seit
+        # Einführung von player_id fehlgeschlagen ist, während gleichzeitig
+        # eine umfassendere comlink-Störung im Gange ist.
+        removed = db.delete_players_not_in(player_ids) if updated > 0 else 0
         return updated, failed, removed
 
     @tasks.loop(hours=24)
