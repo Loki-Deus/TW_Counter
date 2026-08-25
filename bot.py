@@ -1144,7 +1144,7 @@ if ROSTER_FEATURE_ENABLED:
         await interaction.response.defer(ephemeral=True)
 
         try:
-            resolved_ally_code, player_name, units = await roster.fetch_roster(
+            resolved_ally_code, player_name, resolved_player_id, units = await roster.fetch_roster(
                 ally_code=normalized
             )
         except roster.AllyCodeNotFoundError as e:
@@ -1157,7 +1157,7 @@ if ROSTER_FEATURE_ENABLED:
             )
             return
 
-        db.upsert_player(resolved_ally_code, player_name)
+        db.upsert_player(resolved_ally_code, player_name, resolved_player_id)
         await asyncio.to_thread(db.save_roster, resolved_ally_code, player_name, units)
         db.link_discord_id(resolved_ally_code, str(interaction.user.id))
 
@@ -1186,13 +1186,14 @@ if ROSTER_FEATURE_ENABLED:
             return
 
         await interaction.response.defer(ephemeral=True)
-        updated, failed = await _refresh_guild_rosters()
+        updated, failed, removed = await _refresh_guild_rosters()
 
         await interaction.followup.send(
-            f"Roster-Refresh abgeschlossen: {updated} aktualisiert, {failed} fehlgeschlagen."
+            f"Roster-Refresh abgeschlossen: {updated} aktualisiert, {failed} fehlgeschlagen, "
+            f"{removed} wegen Gilden-Austritt entfernt."
         )
 
-    async def _refresh_guild_rosters() -> tuple[int, int]:
+    async def _refresh_guild_rosters() -> tuple[int, int, int]:
         """
         Zieht die komplette Mitgliederliste der hinterlegten SWGOH-Gilde
         über comlink (roster.fetch_guild_members() liefert playerId-Werte,
@@ -1202,6 +1203,17 @@ if ROSTER_FEATURE_ENABLED:
         erst aus der Antwort von roster.fetch_roster(player_id=...), nicht
         aus der Gilden-Mitgliederliste selbst (die liefert nur playerId).
 
+        Reconciliation am Ende (siehe Chat-Verlauf): Spieler, deren
+        player_id NICHT mehr in der aktuellen Mitgliederliste auftaucht,
+        haben die Gilde verlassen -- ihre players-/roster_units-Zeilen
+        werden entfernt (db.delete_players_not_in()), statt für immer als
+        Karteileichen liegen zu bleiben und /tw_zone_attack irgendwann
+        jemanden empfehlen zu lassen, der gar nicht mehr da ist. Läuft
+        NACH der Update-Schleife, mit der VOLLSTÄNDIGEN player_ids-Liste
+        (nicht nur den erfolgreich aktualisierten) -- ein einzelner
+        fehlgeschlagener Fetch soll niemanden fälschlich als "ausgetreten"
+        behandeln, siehe db.delete_players_not_in()-Docstring.
+
         Sequentiell statt parallel (asyncio.gather): das ist die selbst
         gehostete comlink-Instanz, absichtlich kein Ansturm aus N
         gleichzeitigen Requests gegen das eigentliche Spiel-Backend
@@ -1209,28 +1221,28 @@ if ROSTER_FEATURE_ENABLED:
         Dutzend Requests/Sekunde pro IP). Ein einzelner fehlgeschlagener
         Spieler bricht den Rest des Durchlaufs nicht ab.
 
-        Gibt (0, 0) zurück, wenn keine Gilden-ID hinterlegt ist ODER die
+        Gibt (0, 0, 0) zurück, wenn keine Gilden-ID hinterlegt ist ODER die
         Mitgliederliste nicht geladen werden konnte -- kein Fehler in
         diesem Fall, der Aufrufer entscheidet, ob/wie das gemeldet wird.
         """
         guild_row = db.get_swgoh_guild()
         if guild_row is None:
-            return 0, 0
+            return 0, 0, 0
 
         try:
             player_ids = await roster.fetch_guild_members(guild_row["guild_id"])
         except (roster.AllyCodeNotFoundError, roster.RosterFetchError) as e:
             logger.warning("Gilden-Mitgliederliste konnte nicht geladen werden: %s", e)
-            return 0, 0
+            return 0, 0, 0
 
         updated = 0
         failed = 0
         for player_id in player_ids:
             try:
-                ally_code, player_name, units = await roster.fetch_roster(
+                ally_code, player_name, resolved_player_id, units = await roster.fetch_roster(
                     player_id=player_id
                 )
-                db.upsert_player(ally_code, player_name)
+                db.upsert_player(ally_code, player_name, resolved_player_id)
                 await asyncio.to_thread(db.save_roster, ally_code, player_name, units)
                 updated += 1
             except (roster.AllyCodeNotFoundError, roster.RosterFetchError) as e:
@@ -1238,17 +1250,21 @@ if ROSTER_FEATURE_ENABLED:
                     "Roster-Refresh für playerId %s fehlgeschlagen: %s", player_id, e
                 )
                 failed += 1
-        return updated, failed
+
+        removed = db.delete_players_not_in(player_ids)
+        return updated, failed, removed
 
     @tasks.loop(hours=24)
     async def refresh_rosters_task():
-        updated, failed = await _refresh_guild_rosters()
-        if updated == 0 and failed == 0:
+        updated, failed, removed = await _refresh_guild_rosters()
+        if updated == 0 and failed == 0 and removed == 0:
             return  # keine Gilden-ID hinterlegt -- kein Log-Rauschen jede Nacht
         logger.info(
-            "Nächtlicher Gilden-Roster-Refresh abgeschlossen: %d aktualisiert, %d fehlgeschlagen.",
+            "Nächtlicher Gilden-Roster-Refresh abgeschlossen: %d aktualisiert, "
+            "%d fehlgeschlagen, %d Spieler wegen Gilden-Austritt entfernt.",
             updated,
             failed,
+            removed,
         )
 
     @refresh_rosters_task.before_loop

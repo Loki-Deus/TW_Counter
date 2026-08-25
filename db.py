@@ -87,8 +87,17 @@ CREATE TABLE IF NOT EXISTS players (
     ally_code   TEXT PRIMARY KEY,
     player_name TEXT,
     discord_id  TEXT UNIQUE,
+    player_id   TEXT,
     last_synced INTEGER
 );
+-- Kein "CREATE INDEX ... ON players(player_id)" hier -- das lief einmal
+-- GEGEN eine bestehende players-Tabelle, bevor die untenstehende Migration
+-- die Spalte überhaupt angelegt hatte ("no such column: player_id"), weil
+-- CREATE TABLE IF NOT EXISTS bei einer schon existierenden Tabelle ein
+-- No-Op ist. Der Index wird stattdessen ausschließlich in
+-- _migrate_players_add_player_id() erzeugt, NACHDEM die Spalte sicher
+-- existiert -- exakt derselbe Fehler wie einmal zuvor bei
+-- idx_roster_units_ally, siehe dortige Historie in db.py.
 
 -- roster_units wird bei jedem Refresh komplett ersetzt (DELETE + INSERT,
 -- siehe save_roster()), nicht inkrementell gepflegt -- ein Refresh liefert
@@ -166,6 +175,7 @@ def init_db() -> None:
         _migrate_players_schema(conn)
         conn.executescript(SCHEMA)
         _migrate_reports_add_banners(conn)
+        _migrate_players_add_player_id(conn)
 
 
 def _migrate_players_schema(conn: sqlite3.Connection) -> None:
@@ -221,6 +231,31 @@ def _migrate_reports_add_banners(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(reports)").fetchall()}
     if "banners" not in columns:
         conn.execute("ALTER TABLE reports ADD COLUMN banners INTEGER")
+
+
+def _migrate_players_add_player_id(conn: sqlite3.Connection) -> None:
+    """
+    Analog zu _migrate_reports_add_banners() -- ALTER TABLE ADD COLUMN ist
+    nicht idempotent, PRAGMA-Check davor macht das sicher wiederholbar.
+
+    player_id (comlinks interne Spieler-ID) wird für
+    db.delete_players_not_in() gebraucht: Gilden-Abgänge zuverlässig zu
+    erkennen braucht einen stabilen Schlüssel, der direkt mit
+    fetch_guild_members()'s Rückgabewerten (auch playerIds) vergleichbar
+    ist -- ally_code allein reicht dafür nicht, weil die Gilden-
+    Mitgliederliste selbst nur playerIds liefert, nie Ally-Codes (siehe
+    roster.fetch_guild_members()-Docstring). Bereits VOR dieser Änderung
+    gespeicherte Spieler haben hier NULL, bis der nächste Refresh sie neu
+    schreibt -- absichtlich kein Problem: db.delete_players_not_in()
+    lässt player_id IS NULL-Zeilen unangetastet, siehe dortiger Docstring.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(players)").fetchall()}
+    if "player_id" not in columns:
+        conn.execute("ALTER TABLE players ADD COLUMN player_id TEXT")
+    # Unconditional (IF NOT EXISTS), NICHT nur im obigen if-Zweig: muss
+    # sowohl nach einem frischen ALTER TABLE als auch bei einer bereits
+    # vorhandenen Spalte (frischer Install über SCHEMA) sicher greifen.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_players_player_id ON players(player_id)")
 
 
 def add_counter(
@@ -459,21 +494,30 @@ def get_swgoh_guild() -> sqlite3.Row | None:
         return conn.execute("SELECT * FROM swgoh_guild WHERE id = 1").fetchone()
 
 
-def upsert_player(ally_code: str, player_name: str) -> None:
+def upsert_player(ally_code: str, player_name: str, player_id: str | None = None) -> None:
     """
-    Legt einen Spieler an oder aktualisiert nur seinen Namen -- fasst
-    discord_id NICHT an. Für den guild-weiten Refresh: jedes über
-    roster.fetch_guild_members() gefundene Mitglied bekommt hier einen
-    Datensatz, unabhängig davon, ob es je /tw_register genutzt hat.
+    Legt einen Spieler an oder aktualisiert Name und (falls angegeben)
+    player_id -- fasst discord_id NICHT an. Für den guild-weiten Refresh:
+    jedes über roster.fetch_guild_members() gefundene Mitglied bekommt
+    hier einen Datensatz, unabhängig davon, ob es je /tw_register genutzt
+    hat.
+
+    player_id per COALESCE geschrieben, nicht direkt überschrieben: ein
+    Aufrufer ohne bekannte player_id (player_id=None) darf eine bereits
+    gespeicherte NICHT stillschweigend auf NULL zurücksetzen -- das würde
+    db.delete_players_not_in() sonst nachträglich wieder blind machen für
+    genau diesen Spieler.
     """
     with get_connection() as conn:
         conn.execute(
             """
-            INSERT INTO players (ally_code, player_name)
-            VALUES (?, ?)
-            ON CONFLICT(ally_code) DO UPDATE SET player_name = excluded.player_name
+            INSERT INTO players (ally_code, player_name, player_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT(ally_code) DO UPDATE SET
+                player_name = excluded.player_name,
+                player_id = COALESCE(excluded.player_id, players.player_id)
             """,
-            (ally_code, player_name),
+            (ally_code, player_name, player_id),
         )
 
 
@@ -671,3 +715,40 @@ def get_owned_unit_display_names() -> list[str]:
             """
         ).fetchall()
         return [row["display_name"] for row in rows]
+
+
+def delete_players_not_in(player_ids: list[str]) -> int:
+    """
+    Entfernt alle players-Zeilen (und per CASCADE ihre roster_units),
+    deren player_id gesetzt ist, aber NICHT mehr in `player_ids`
+    auftaucht -- echte Gilden-Abgänge, bestätigt durch Abwesenheit in der
+    autoritativen comlink-Mitgliederliste selbst (roster.fetch_guild_members()),
+    NICHT durch einen fehlgeschlagenen Einzel-Fetch für diesen Spieler
+    (der könnte transient sein -- ein Netzwerk-Hänger beim Abrufen EINES
+    Spielers heißt nicht, dass er die Gilde verlassen hat).
+
+    Zeilen mit player_id IS NULL (z.B. Registrierungen von vor Einführung
+    dieser Spalte, siehe _migrate_players_add_player_id()) werden NIE
+    automatisch gelöscht -- ohne player_id kann nicht sicher unterschieden
+    werden, ob sie noch Mitglied sind, also lieber gar nichts tun als
+    versehentlich jemanden Aktives entfernen.
+
+    SICHERHEITSSPERRE: eine leere player_ids-Liste löscht NICHTS und gibt
+    0 zurück, statt "niemand ist mehr Mitglied" zu unterstellen. Eine
+    leere Liste hier bedeutet fast immer einen comlink-Fehler oder einen
+    Bug in fetch_guild_members(), nicht eine tatsächlich leere Gilde --
+    ohne diese Sperre würde ein solcher Fehler die gesamte players-Tabelle
+    leeren, nicht nur nichts tun.
+    """
+    if not player_ids:
+        return 0
+    with get_connection() as conn:
+        placeholders = ",".join("?" * len(player_ids))
+        cur = conn.execute(
+            f"""
+            DELETE FROM players
+            WHERE player_id IS NOT NULL AND player_id NOT IN ({placeholders})
+            """,
+            player_ids,
+        )
+        return cur.rowcount

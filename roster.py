@@ -140,7 +140,7 @@ def _parse_roster_unit(raw_unit: dict) -> dict:
 
 async def fetch_roster(
     ally_code: str | None = None, player_id: str | None = None
-) -> tuple[str, str, list[dict]]:
+) -> tuple[str, str, str, list[dict]]:
     """
     Holt das komplette Roster für einen Spieler -- entweder über Ally-Code
     ODER über comlinks interne playerId (genau eines von beiden). playerId
@@ -149,12 +149,19 @@ async def fetch_roster(
     playerId, keinen Ally-Code, bestätigt gegen einen echten Response).
     ally_code bleibt der Weg für /tw_register, wo der Nutzer ihn direkt angibt.
 
-    Gibt (ally_code, player_name, units) zurück -- ally_code wird IMMER aus
-    der vollen Antwort gelesen (player_data['allyCode']), nicht vom
-    Aufrufer übernommen: bei einem player_id-Aufruf kennt der Aufrufer den
-    Ally-Code vorher noch gar nicht, der steht erst in der Antwort
-    (bestätigt: player_data enthält 'allyCode' als Klartext-Feld,
-    unabhängig davon ob per allycode= oder player_id= abgefragt wurde).
+    Gibt (ally_code, player_name, player_id, units) zurück -- ally_code UND
+    player_id werden IMMER aus der vollen Antwort gelesen
+    (player_data['allyCode']/['playerId']), nicht vom Aufrufer übernommen:
+    bei einem player_id-Aufruf kennt der Aufrufer den Ally-Code vorher noch
+    gar nicht, und umgekehrt bei einem ally_code-Aufruf (z.B. /tw_register)
+    die playerId nicht -- beide Felder liegen aber als Klartext auf der
+    player-Antwort, unabhängig davon, wie abgefragt wurde (bestätigt gegen
+    einen echten Response, siehe Chat-Verlauf). player_id wird jetzt
+    IMMER mitgespeichert (siehe db.upsert_player()), auch bei /tw_register
+    -- Grundlage für db.delete_players_not_in(), das echte Gilden-Abgänge
+    erkennen muss, was ohne eine stabile playerId pro Spieler nicht
+    zuverlässig von einem bloß fehlgeschlagenen Einzel-Fetch unterscheidbar
+    wäre.
 
     Raises:
         AllyCodeNotFoundError -- Ally-Code/playerId comlink unbekannt.
@@ -178,8 +185,9 @@ async def fetch_roster(
         raise AllyCodeNotFoundError(f"Kein Spieler gefunden ({identifier}).")
 
     resolved_ally_code = player_data.get("allyCode", ally_code or "")
+    resolved_player_id = player_data.get("playerId", player_id or "")
     units = [_parse_roster_unit(u) for u in player_data["rosterUnit"]]
-    return resolved_ally_code, player_data.get("name", ""), units
+    return resolved_ally_code, player_data.get("name", ""), resolved_player_id, units
 
 
 async def resolve_guild_id(seed_ally_code: str) -> tuple[str, str]:
