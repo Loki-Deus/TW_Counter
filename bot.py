@@ -65,11 +65,13 @@ import asyncio
 import logging
 import math
 from collections import Counter
+from io import BytesIO
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from discord.ext.commands import Bot
+from PIL import Image, ImageDraw, ImageFont
 
 import config
 import db
@@ -215,6 +217,12 @@ BUCKET_ORDER = ("under", "even", "over")
 BUCKET_LABELS = {"under": "Unterlegen", "even": "Ausgeglichen", "over": "Überlegen"}
 _DISCORD_MESSAGE_LIMIT = 1900  # Sicherheitsabstand zum harten 2000-Zeichen-Limit
 
+# /tw_lookup zeigt standardmäßig nur die Top N (nach Ausgeglichen-Quote
+# sortiert) statt aller Konter -- volle Liste über alle=True. Reiner
+# Lesbarkeits-/Mobile-Kompromiss, keine Datenbeschränkung: die restlichen
+# Zeilen existieren weiterhin in der DB, werden nur nicht ausgegeben.
+_LOOKUP_TOP_N = 7
+
 
 def _aggregate_bucket_stats(attackers: list[str], bucket_rows: list) -> dict:
     """
@@ -324,12 +332,15 @@ def rank_attackers(defending_leader: str) -> list[dict]:
     ]
 
 
-def format_lookup_table(
-    defending_leader: str, attackers: list[str], bucket_rows: list, banner_rows: list
-) -> list[str]:
+def _build_lookup_rows(
+    attackers: list[str], bucket_rows: list, banner_rows: list, alle: bool = False
+) -> tuple[list[tuple[str, str, str, str, str]], bool, int]:
     """
-    Baut die /tw_lookup-Ausgabe. Reine Funktion ohne discord.Interaction-
-    Abhängigkeit, dadurch isoliert testbar.
+    Gemeinsame Aggregations-/Sortier-/Kürzungsbasis für /tw_lookup, geteilt
+    zwischen format_lookup_table() (Codeblock-Tabelle) und
+    render_lookup_image() (PNG) -- beide Ausgabeformen sollen garantiert
+    dieselben Zeilen in derselben Reihenfolge zeigen, nie zwei getrennte
+    Implementierungen, die auseinanderlaufen können.
 
     attackers: ALLE existierenden Konter gegen defending_leader (auch ohne
                Reports) — aus db.get_attackers_for_defender().
@@ -340,11 +351,17 @@ def format_lookup_table(
     banner_rows: aus db.get_banner_stats() -- Angreifer ohne jede
                Banner-Angabe fehlen darin, werden hier als leere vierte
                Spalte dargestellt, nicht als 0.
+    alle: False (Standard) kürzt auf die Top _LOOKUP_TOP_N nach der
+               Sortierung unten. True liefert alle Zeilen.
 
     Primärsortierung: ausgeglichen-Quote absteigend; Konter ohne
     ausgeglichen-Daten sinken ans Ende. Banner fließt bewusst NICHT in die
     Sortierung ein -- es ist ein optionales Zusatzfeld, keine Ranking-Basis
     (Stakeholder-Vorgabe: rein informativ als vierte Spalte).
+
+    Rückgabe: (rows, truncated, total_count) -- rows sind bereits
+    Anzeige-Strings (nicht die rohen Bucket-Dicts), truncated/total_count
+    tragen genug Info für einen Hinweistext in beiden Ausgabeformen.
     """
     stats = _aggregate_bucket_stats(attackers, bucket_rows)
     banner_stats = _aggregate_banner_stats(banner_rows)
@@ -373,6 +390,34 @@ def format_lookup_table(
             return ""
         return f"{b['avg']:.1f}"
 
+    total_count = len(ordered)
+    truncated = not alle and total_count > _LOOKUP_TOP_N
+    if truncated:
+        ordered = ordered[:_LOOKUP_TOP_N]
+
+    rows = [
+        (a, cell(a, "under"), cell(a, "even"), cell(a, "over"), banner_cell(a))
+        for a in ordered
+    ]
+    return rows, truncated, total_count
+
+
+def format_lookup_table(
+    defending_leader: str,
+    attackers: list[str],
+    bucket_rows: list,
+    banner_rows: list,
+    alle: bool = False,
+) -> list[str]:
+    """
+    Baut die /tw_lookup-Textausgabe (Codeblock-Tabelle). Reine Funktion ohne
+    discord.Interaction-Abhängigkeit, dadurch isoliert testbar. Aggregation/
+    Sortierung/Kürzung liegt in _build_lookup_rows(), s. dortiger Docstring.
+    """
+    rows, truncated, total_count = _build_lookup_rows(
+        attackers, bucket_rows, banner_rows, alle
+    )
+
     col_attacker, col_bucket, col_banner = 28, 15, 8
     header_line = (
         f"{'Angreifer':<{col_attacker}} "
@@ -384,11 +429,11 @@ def format_lookup_table(
     separator_line = "-" * (col_attacker + 3 * col_bucket + col_banner + 4)
     body_lines = [
         f"{a:<{col_attacker}} "
-        f"{cell(a, 'under'):<{col_bucket}} "
-        f"{cell(a, 'even'):<{col_bucket}} "
-        f"{cell(a, 'over'):<{col_bucket}} "
-        f"{banner_cell(a):<{col_banner}}"
-        for a in ordered
+        f"{u:<{col_bucket}} "
+        f"{e:<{col_bucket}} "
+        f"{o:<{col_bucket}} "
+        f"{b:<{col_banner}}"
+        for a, u, e, o, b in rows
     ]
 
     title = f"**Konter gegen {defending_leader}**\n"
@@ -408,7 +453,130 @@ def format_lookup_table(
     if len(chunk) > 2:
         messages.append(title + "```\n" + "\n".join(chunk) + "\n```")
 
+    if truncated:
+        # Hängt an die letzte Nachricht an, außerhalb des Codeblocks --
+        # Markdown-Kursivtext funktioniert dort normal.
+        messages[-1] += (
+            f"\n_Zeige Top {_LOOKUP_TOP_N} von {total_count} Angreifern "
+            f"(sortiert nach Ausgeglichen-Quote). "
+            f"`/tw_lookup verteidiger:{defending_leader} alle:True` für alle._"
+        )
+
     return messages
+
+
+# ── Lookup-Bild-Rendering ─────────────────────────────────────────────────
+# Alternative zur Codeblock-Tabelle oben: rendert dieselben Zeilen
+# (_build_lookup_rows()) als PNG. Discords mobile Clients umbrechen breite
+# fixed-width-Codeblöcke hässlich; ein Bild bleibt formatiert, unabhängig
+# von Bildschirmbreite oder Schriftgröße des Nutzers. Erfordert Pillow
+# (requirements.txt) und ein Font-Paket im Image (siehe Dockerfile) --
+# ohne Font-Paket greift der except-Zweig unten (funktioniert, sieht aber
+# schlechter aus).
+
+_IMG_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+_IMG_FONT_BOLD_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
+_IMG_FONT_SIZE = 20
+_IMG_ROW_HEIGHT = 32
+_IMG_PADDING = 12
+_IMG_BG = (43, 45, 49)  # angelehnt an Discords dunkles Theme
+_IMG_HEADER_BG = (32, 34, 37)
+_IMG_TEXT = (220, 221, 222)
+_IMG_FOOTER_TEXT = (150, 152, 157)
+_IMG_GRID = (60, 63, 68)
+
+
+def render_lookup_image(
+    defending_leader: str,
+    attackers: list[str],
+    bucket_rows: list,
+    banner_rows: list,
+    alle: bool = False,
+) -> BytesIO:
+    """
+    Rendert /tw_lookup als PNG statt als Codeblock. Nutzt dieselbe
+    Aggregation/Sortierung/Kürzung wie format_lookup_table() über
+    _build_lookup_rows(), damit Text- und Bildausgabe nie auseinanderlaufen.
+    Gibt einen bereits auf Position 0 zurückgespulten BytesIO zurück, direkt
+    für discord.File geeignet.
+    """
+    rows, truncated, total_count = _build_lookup_rows(
+        attackers, bucket_rows, banner_rows, alle
+    )
+
+    try:
+        font = ImageFont.truetype(_IMG_FONT_PATH, _IMG_FONT_SIZE)
+        font_bold = ImageFont.truetype(_IMG_FONT_BOLD_PATH, _IMG_FONT_SIZE)
+    except OSError:
+        # Font-Paket fehlt im Image (siehe Dockerfile-Kommentar) -- Pillows
+        # eingebauter Default-Font ist hässlich, aber ein harter Crash beim
+        # Rendern wäre schlimmer als eine unschöne Tabelle.
+        font = font_bold = ImageFont.load_default()
+
+    headers = (
+        "Angreifer",
+        BUCKET_LABELS["under"],
+        BUCKET_LABELS["even"],
+        BUCKET_LABELS["over"],
+        "Banner",
+    )
+    all_rows = [headers] + rows
+
+    # Spaltenbreiten aus tatsächlichem Textinhalt -- proportionale Fonts
+    # vertragen kein festes Zeichenraster wie im Codeblock.
+    measurer = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    col_widths = [
+        max(
+            measurer.textlength(row[col], font=font_bold if row is headers else font)
+            for row in all_rows
+        )
+        + 2 * _IMG_PADDING
+        for col in range(5)
+    ]
+
+    title_height = 50
+    footer_height = 28 if truncated else 0
+    width = int(sum(col_widths))
+    height = title_height + _IMG_ROW_HEIGHT * len(all_rows) + footer_height + _IMG_PADDING
+
+    img = Image.new("RGB", (width, height), _IMG_BG)
+    draw = ImageDraw.Draw(img)
+    draw.text(
+        (_IMG_PADDING, 12),
+        f"Konter gegen {defending_leader}",
+        font=font_bold,
+        fill=_IMG_TEXT,
+    )
+
+    y = title_height
+    for row_idx, row in enumerate(all_rows):
+        is_header = row_idx == 0
+        if is_header:
+            draw.rectangle([0, y, width, y + _IMG_ROW_HEIGHT], fill=_IMG_HEADER_BG)
+        x = _IMG_PADDING
+        for col_idx, cell_text in enumerate(row):
+            draw.text(
+                (x, y + 6),
+                cell_text,
+                font=font_bold if is_header else font,
+                fill=_IMG_TEXT,
+            )
+            x += col_widths[col_idx]
+        draw.line([0, y + _IMG_ROW_HEIGHT, width, y + _IMG_ROW_HEIGHT], fill=_IMG_GRID)
+        y += _IMG_ROW_HEIGHT
+
+    if truncated:
+        draw.text(
+            (_IMG_PADDING, y + 4),
+            f"Zeige Top {_LOOKUP_TOP_N} von {total_count} — alle:True für alle",
+            font=font,
+            fill=_IMG_FOOTER_TEXT,
+        )
+
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
 
 
 # ── /tw_add ───────────────────────────────────────────────────────────────
@@ -557,8 +725,17 @@ tw_report.autocomplete("angreifer")(attacker_for_defender_autocomplete)
 @tree.command(
     name="tw_lookup", description="Zeigt alle bekannten Konter gegen einen Verteidiger"
 )
-@app_commands.describe(verteidiger="Verteidigender Anführer")
-async def tw_lookup(interaction: discord.Interaction, verteidiger: str):
+@app_commands.describe(
+    verteidiger="Verteidigender Anführer",
+    alle=f"Alle Konter zeigen statt nur der Top {_LOOKUP_TOP_N} (Standard: aus)",
+    bild="Als Bild statt als Tabelle senden -- besser lesbar auf Mobilgeräten (Standard: aus)",
+)
+async def tw_lookup(
+    interaction: discord.Interaction,
+    verteidiger: str,
+    alle: bool = False,
+    bild: bool = False,
+):
     attackers = db.get_attackers_for_defender(verteidiger)
     if not attackers:
         await interaction.response.send_message(
@@ -568,7 +745,19 @@ async def tw_lookup(interaction: discord.Interaction, verteidiger: str):
 
     bucket_rows = db.get_bucket_stats(verteidiger)
     banner_rows = db.get_banner_stats(verteidiger)
-    messages = format_lookup_table(verteidiger, attackers, bucket_rows, banner_rows)
+
+    if bild:
+        image = render_lookup_image(
+            verteidiger, attackers, bucket_rows, banner_rows, alle=alle
+        )
+        await interaction.response.send_message(
+            file=discord.File(image, filename="tw_lookup.png")
+        )
+        return
+
+    messages = format_lookup_table(
+        verteidiger, attackers, bucket_rows, banner_rows, alle=alle
+    )
 
     await interaction.response.send_message(messages[0])
     for extra in messages[1:]:
@@ -1536,10 +1725,12 @@ async def tw_help(interaction: discord.Interaction):
         "**`/tw_report verteidiger verteidiger_relic angreifer angreifer_relic ergebnis banner`** — *Mitglieder-Rolle*\n"
         "Meldet ein Kampfergebnis für einen bereits existierenden Konter. `banner` ist optional bei "
         "Sieg; bei Niederlage wird er automatisch auf 0 gesetzt, ein trotzdem eingetragener Wert wird überschrieben.",
-        "**`/tw_lookup verteidiger`** — *alle*\n"
-        "Zeigt alle Konter gegen einen Verteidiger, sortiert nach Ausgeglichen-Quote, "
-        "inklusive Durchschnitts-Banner als vierte Spalte (nur für Angreifer mit mindestens "
-        "einer Banner-Angabe).",
+        "**`/tw_lookup verteidiger alle bild`** — *alle*\n"
+        "Zeigt Konter gegen einen Verteidiger, sortiert nach Ausgeglichen-Quote, "
+        f"inklusive Durchschnitts-Banner als vierte Spalte (nur für Angreifer mit mindestens "
+        f"einer Banner-Angabe). Standardmäßig nur die Top {_LOOKUP_TOP_N}, `alle:True` zeigt "
+        "alle. `bild:True` sendet eine PNG-Tabelle statt eines Codeblocks (besser lesbar auf "
+        "Mobilgeräten).",
         "**`/tw_zone_add name bild_url`** — *Spezialisten-Rolle*\n"
         "Legt eine TW-Zone an (Kartenreferenz für `/tw_zone_attack`).",
         "**`/tw_zone_attack zone verteidiger_1 verteidiger_2 verteidiger_3 mitgliederliste`** — *Manager/Admin*\n"

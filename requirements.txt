@@ -10,3 +10,8 @@ anthropic>=0.40.0
 # eine neuere Version die in roster.py angenommene get_player()-Signatur
 # geändert hat.
 swgoh-comlink>=1.11.0
+# Für /tw_lookup bild:True -- rendert die Konter-Tabelle als PNG statt als
+# Codeblock (siehe bot.py: render_lookup_image()). Braucht ein Font-Paket
+# im Image, um nicht auf Pillows hässlichen Bitmap-Default zurückzufallen
+# -- siehe Dockerfile (fonts-dejavu-core).
+Pillow>=10.0.0
