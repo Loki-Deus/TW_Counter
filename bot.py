@@ -637,7 +637,8 @@ tw_add.autocomplete("verteidiger")(character_autocomplete)
     angreifer="Angreifender Anführer",
     angreifer_relic="Relic-Level des Angreifer-Anführers (0-20)",
     ergebnis="Sieg oder Niederlage",
-    banner="Erzielte Banner (optional bei Sieg; bei Niederlage automatisch 0)",
+    banner="Erzielte Banner laut Spiel-UI (optional bei Sieg; bei Niederlage automatisch 0). "
+    "Mehrfachangriffs-Abzug wird automatisch ausgeglichen.",
 )
 @app_commands.choices(
     ergebnis=[
@@ -676,8 +677,17 @@ async def tw_report(
     # Bestätigungsnachricht unten weist explizit darauf hin, damit niemand
     # rätselt, warum der gemeldete Wert vom gespeicherten abweicht.
     banner_overridden = ergebnis.value == 0 and banner is not None and banner != 0
+    raw_banner = banner  # für die Bestätigungsnachricht, falls unten korrigiert wird
+    banner_penalty_corrected = False
     if ergebnis.value == 0:
         banner = 0
+    elif banner is not None:
+        # TW-Mehrfachangriffs-Bannerabzug ausgleichen (siehe
+        # config.correct_banner_penalty()) -- nur bei Siegen relevant, eine
+        # Niederlage gibt ohnehin immer 0 Banner (Zweig oben).
+        corrected = config.correct_banner_penalty(banner)
+        banner_penalty_corrected = corrected != banner
+        banner = corrected
 
     # app_commands.Range erzwingt MIN_RELIC..MAX_RELIC bereits clientseitig
     # (Discord zeigt ein Zahlenfeld mit diesen Grenzen) und serverseitig beim
@@ -704,6 +714,11 @@ async def tw_report(
     bucket_label = BUCKET_LABELS[config.bucket_for_delta(delta)]
     if banner_overridden:
         banner_suffix = ", Banner: 0 (Niederlage — eingegebener Wert wurde überschrieben)"
+    elif banner_penalty_corrected:
+        banner_suffix = (
+            f", Banner: {banner} (Mehrfachangriffs-Abzug ausgeglichen, "
+            f"eingegeben: {raw_banner})"
+        )
     elif banner is not None:
         banner_suffix = f", Banner: {banner}"
     else:
@@ -728,13 +743,13 @@ tw_report.autocomplete("angreifer")(attacker_for_defender_autocomplete)
 @app_commands.describe(
     verteidiger="Verteidigender Anführer",
     alle=f"Alle Konter zeigen statt nur der Top {_LOOKUP_TOP_N} (Standard: aus)",
-    bild="Als Bild statt als Tabelle senden -- besser lesbar auf Mobilgeräten (Standard: aus)",
+    bild="Als Bild statt als Tabelle senden -- besser lesbar auf Mobilgeräten (Standard: an, bild:False für Codeblock-Tabelle)",
 )
 async def tw_lookup(
     interaction: discord.Interaction,
     verteidiger: str,
     alle: bool = False,
-    bild: bool = False,
+    bild: bool = True,
 ):
     attackers = db.get_attackers_for_defender(verteidiger)
     if not attackers:
@@ -1729,8 +1744,8 @@ async def tw_help(interaction: discord.Interaction):
         "Zeigt Konter gegen einen Verteidiger, sortiert nach Ausgeglichen-Quote, "
         f"inklusive Durchschnitts-Banner als vierte Spalte (nur für Angreifer mit mindestens "
         f"einer Banner-Angabe). Standardmäßig nur die Top {_LOOKUP_TOP_N}, `alle:True` zeigt "
-        "alle. `bild:True` sendet eine PNG-Tabelle statt eines Codeblocks (besser lesbar auf "
-        "Mobilgeräten).",
+        "alle. Ergebnis kommt standardmäßig als Bild (besser lesbar auf Mobilgeräten), "
+        "`bild:False` sendet stattdessen einen Codeblock.",
         "**`/tw_zone_add name bild_url`** — *Spezialisten-Rolle*\n"
         "Legt eine TW-Zone an (Kartenreferenz für `/tw_zone_attack`).",
         "**`/tw_zone_attack zone verteidiger_1 verteidiger_2 verteidiger_3 mitgliederliste`** — *Manager/Admin*\n"
