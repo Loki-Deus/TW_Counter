@@ -27,9 +27,40 @@ services:
     volumes:
       - tw-counter-data:/app/data
 
+  tb-reminder:
+    build:
+      context: https://github.com/Loki-Deus/TB_Reminder.git
+      dockerfile: Dockerfile
+    image: tb-reminder:latest
+    container_name: tb-reminder
+    restart: unless-stopped
+    environment:
+      - DISCORD_TOKEN=${TB_DISCORD_TOKEN}
+      # Geteilt mit tw-counter -- derselbe Discord-Server, siehe .env.example.
+      - GUILD_ID=${GUILD_ID}
+      - TW_CHANNEL_ID=${TW_CHANNEL_ID}
+      - OFFICER_ID=${OFFICER_ID}
+      - MANAGER_IDS=${TB_MANAGER_IDS}
+      - MEMBER_ROLE_ID=${TB_MEMBER_ROLE_ID}
+      - DATA_DIR=/app/data
+      - BOT_TIMEZONE=${BOT_TIMEZONE:-Europe/Vienna}
+      # Read-only Zugriff auf tw-counters Roster-Mirror (players,
+      # roster_units, unit_names) für /tbreminder_platoons_check und
+      # /tbreminder_platoons_ping -- siehe volumes unten. Hartkodiert wie
+      # COMLINK_URL oben, muss zum :ro-Mount-Pfad passen bleiben.
+      - ROSTER_DB_PATH=/app/roster-data/counters.db
+    volumes:
+      - tb-stats:/app/data
+      # :ro -- tb-reminder liest tw-counters Datenbank nur, schreibt nie.
+      # Ein Bug hier kann damit tw-counters Daten strukturell nicht
+      # beschädigen, unabhängig vom Code-Zustand in tb-reminder.
+      - tw-counter-data:/app/roster-data:ro
+
   # Selbst gehostete swgoh-comlink-Instanz (siehe roster.py) -- kein
   # Port-Mapping nach außen, nur tw-counter im internen Compose-Netzwerk
-  # muss diesen Dienst erreichen können.
+  # muss diesen Dienst erreichen können. tb-reminder spricht comlink NICHT
+  # direkt an -- es liest ausschließlich den bereits von tw-counter
+  # gepflegten Roster-Mirror (siehe oben), keine zweite Comlink-Abhängigkeit.
   comlink:
     image: ghcr.io/swgoh-utils/swgoh-comlink:latest
     container_name: tw-counter-comlink
@@ -41,3 +72,9 @@ volumes:
   tw-counter-data:
     external: true
     name: tw_counter_tw-counter-data
+  # Wiederverwendung des bereits bestehenden TB-Reminder-Volumes --
+  # dieselbe externe Volume-Referenz wie im bisherigen eigenständigen
+  # tb-reminder-Stack, keine neue Volume-Erzeugung, keine Datenmigration.
+  tb-stats:
+    external: true
+    name: tb_reminder_tb-stats
