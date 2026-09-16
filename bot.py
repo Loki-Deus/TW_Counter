@@ -685,7 +685,19 @@ async def tw_report(
         # TW-Mehrfachangriffs-Bannerabzug ausgleichen (siehe
         # config.correct_banner_penalty()) -- nur bei Siegen relevant, eine
         # Niederlage gibt ohnehin immer 0 Banner (Zweig oben).
-        corrected = config.correct_banner_penalty(banner)
+        try:
+            corrected = config.correct_banner_penalty(banner)
+        except config.InvalidBannerCountError:
+            # Wert fällt in keines der drei bekannten Mehrfachangriffs-
+            # Bänder (6-10 / 11-15 / 16-20) -- typischerweise ein
+            # Tippfehler. Bewusst abgelehnt statt unkorrigiert
+            # gespeichert, siehe Docstring dort: ein stiller Fehlwert
+            # würde /tw_lookups Banner-Durchschnitt verzerren, ohne dass
+            # es irgendwo auffällt.
+            await interaction.response.send_message(
+                "Banner-Anzahl fehlerhaft.", ephemeral=True
+            )
+            return
         banner_penalty_corrected = corrected != banner
         banner = corrected
 

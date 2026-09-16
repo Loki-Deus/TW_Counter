@@ -103,6 +103,52 @@ RAW_RELIC_TIER_OFFSET = 2
 MIN_RAW_RELIC_TIER = 3  # entspricht der niedrigsten echten Relic-Stufe, Relic 1
 
 
+class InvalidBannerCountError(ValueError):
+    """/tw_report: banner-Wert fällt in keine der drei bekannten
+    Mehrfachangriffs-Bänder (siehe correct_banner_penalty())."""
+
+
+# SWGOH TW-Bannerregel bei Mehrfachangriffen auf denselben Verteidiger:
+# jeder weitere Angriffsversuch startet mit einer niedrigeren Basis, von
+# der die Anzahl besiegter eigener Einheiten abgezogen wird. Ein Sieg mit
+# allen 5 eigenen Einheiten besiegt ist nicht möglich (Stakeholder-
+# Bestätigung) -- deshalb genau 5 mögliche Werte pro Versuch (0-4 besiegte
+# Einheiten), und die drei Bänder liegen nicht überlappend nebeneinander:
+#   1. Versuch: Basis 20 -> Banner 16-20
+#   2. Versuch: Basis 15 -> Banner 11-15
+#   3.+ Versuch: Basis 10 -> Banner  6-10
+# Weil die Bänder sich nicht überschneiden, verrät der gemeldete Banner-
+# Wert allein bereits, aus welchem Versuch er stammt -- kein zusätzlicher
+# "welcher Versuch war das"-Parameter in /tw_report nötig. Zurückgegeben
+# wird der 1.-Versuch-äquivalente Wert, damit alle gespeicherten
+# banners-Werte in reports unabhängig vom tatsächlichen Versuch
+# vergleichbar sind (siehe /tw_lookup's Banner-Durchschnittsspalte).
+_BANNER_PENALTY_CORRECTIONS = (
+    (16, 20, 0),   # 1. Versuch: bereits normalisiert
+    (11, 15, 5),   # 2. Versuch: +5 -> 1.-Versuch-Äquivalent
+    (6, 10, 10),   # 3.+ Versuch: +10 -> 1.-Versuch-Äquivalent
+)
+
+
+def correct_banner_penalty(banner: int) -> int:
+    """
+    Gleicht den Mehrfachangriffs-Bannerabzug aus -- siehe Bänder-Tabelle
+    oben. Nur für Siege relevant (/tw_report erzwingt banner=0 bei
+    Niederlagen vor diesem Aufruf, siehe bot.py).
+
+    Wirft InvalidBannerCountError, wenn der Wert in keines der drei Bänder
+    fällt (z.B. Tippfehler) -- bewusst kein stillschweigendes Durchreichen
+    eines nicht interpretierbaren Werts, der sonst unkorrigiert in den
+    Banner-Durchschnitt von /tw_lookup einfließen und ihn verzerren würde.
+    """
+    for lower, upper, correction in _BANNER_PENALTY_CORRECTIONS:
+        if lower <= banner <= upper:
+            return banner + correction
+    raise InvalidBannerCountError(
+        f"Banner-Wert {banner} liegt in keinem gültigen Bereich (6-10, 11-15, 16-20)."
+    )
+
+
 def relic_tier_to_display(raw_relic_tier: int | None) -> int:
     """Wandelt roster_units.relic_tier (comlinks Rohwert) in die
     tatsächliche, im Spiel angezeigte Relic-Stufe um. 0 für "kein Relic"
