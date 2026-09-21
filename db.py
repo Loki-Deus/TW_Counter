@@ -387,21 +387,28 @@ def get_bucket_stats(defending_leader: str) -> list[sqlite3.Row]:
 
 def get_banner_stats(defending_leader: str) -> list[sqlite3.Row]:
     """
-    Durchschnittliche Banner-Anzahl pro Angreifer gegen defending_leader.
+    Durchschnittliche Banner-Anzahl pro Angreifer gegen defending_leader,
+    berechnet NUR über SIEGE mit eingetragenem Banner-Wert.
     ANDERS als get_bucket_stats() NICHT nach Bucket gruppiert: Banner ist
     ein optionales, vom Relic-Delta unabhängiges Feld -- es steht als
     eigene, vierte Spalte neben den drei Buckets, nicht als deren
     Aufteilung (Stakeholder-Vorgabe, siehe Chat).
 
-    WHERE r.banners IS NOT NULL filtert NUR Reports ohne jede Banner-
-    Angabe heraus -- das betrifft ausschließlich Siege ohne manuell
-    eingetragenen Wert (banner ist dort optional). Niederlagen tragen seit
-    bot.py's tw_report IMMER eine konkrete 0 (kein NULL mehr, siehe dortiger
-    Kommentar zu banner_overridden) und fließen damit korrekt in den
-    Schnitt ein, statt fälschlich ausgeschlossen zu werden -- ein
-    Verteidiger mit vielen Niederlagen soll einen entsprechend niedrigeren
-    Banner-Schnitt zeigen, nicht künstlich nur aus den Siegen berechnet
-    werden.
+    Bewusst nur Siege (geändert): Niederlagen tragen per Spielregel immer 0
+    Banner (bot.py erzwingt das). Vorher flossen sie als Nullen in den
+    Durchschnitt ein, während Siege OHNE eingetragenen Banner-Wert (Feld ist
+    optional) gar nicht zählten. Bei Angreifern mit vielen Siegen ohne
+    Banner-Angabe ergab das Werte weit unter dem Bereich 16-20, den ein
+    korrigierter Sieg immer hat (Beispiel: 19 Siege, 5 Niederlagen, nur 8
+    Siege mit Banner -> Schnitt 11,1 statt 18). Die Sieg-/Niederlage-Quote
+    steht ohnehin in den Bucket-Spalten; die Banner-Spalte soll nur zeigen,
+    wie sauber ein Sieg mit diesem Angreifer typischerweise ausfällt
+    (20 = keine eigene Einheit verloren, 16 = vier verloren, siehe
+    config.correct_banner_penalty()).
+
+    Angreifer ohne einen einzigen Sieg mit Banner-Wert fehlen im Ergebnis
+    (leere Zelle in /tw_lookup) statt mit 0.0 aufzutauchen. banner_count ist
+    die Anzahl der Siege, die in den Schnitt eingehen.
     """
     with get_connection() as conn:
         return conn.execute(
@@ -412,7 +419,7 @@ def get_banner_stats(defending_leader: str) -> list[sqlite3.Row]:
                 COUNT(*)       AS banner_count
             FROM counters c
             JOIN reports r ON r.counter_id = c.id
-            WHERE c.defending_leader = ? AND r.banners IS NOT NULL
+            WHERE c.defending_leader = ? AND r.result = 1 AND r.banners IS NOT NULL
             GROUP BY c.attacking_leader
             """,
             (defending_leader,),

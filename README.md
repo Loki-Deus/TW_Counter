@@ -8,7 +8,7 @@ Sammelt Territory-War-Konter (welcher angreifende Anführer schlägt welchen ver
 
 Jedes gemeldete Ergebnis wird nach Relic-Differenz (Angreifer − Verteidiger) in einen von drei Buckets sortiert: `unterlegen` (Δ ≤ −3), `ausgeglichen` (−2 bis +2), `überlegen` (Δ ≥ +3). Diese Grenzen leben ausschließlich als Konstanten in `config.py` (`UNDER_THRESHOLD`, `OVER_THRESHOLD`).
 
-Zusätzlich zu Sieg/Niederlage kann ein Report optional die Anzahl erzielter **Banner** tragen. Eine Niederlage wird automatisch mit 0 Bannern gespeichert — ein trotzdem eingetragener Wert wird überschrieben, mit Hinweis in der Bestätigung. `/tw_lookup` zeigt den Banner-Durchschnitt pro Angreifer als vierte Spalte (nur für Angreifer mit mindestens einer Banner-Angabe; Niederlagen fließen als echte Nullen ein, nicht ausgeschlossen).
+Zusätzlich zu Sieg/Niederlage kann ein Report optional die Anzahl erzielter **Banner** tragen. Eine Niederlage wird automatisch mit 0 Bannern gespeichert — ein trotzdem eingetragener Wert wird überschrieben, mit Hinweis in der Bestätigung. `/tw_lookup` zeigt den Banner-Durchschnitt pro Angreifer als vierte Spalte. Er wird nur über **Siege mit eingetragenem Banner-Wert** gebildet (Niederlagen zählen nicht als Nullen mit; Angreifer ohne einen solchen Sieg haben eine leere Zelle). Weil jeder gespeicherte Sieg auf einen 1.-Versuch-Wert normalisiert ist (16–20), liegt der Durchschnitt immer in diesem Bereich: 20 = keine eigene Einheit verloren, 16 = vier verloren. Die Sieg-/Niederlage-Quote steht in den Bucket-Spalten.
 
 ## Befehle
 
