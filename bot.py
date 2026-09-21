@@ -1341,16 +1341,29 @@ if ROSTER_FEATURE_ENABLED:
             f"`/tw_register` pro Spieler mehr nötig."
         )
 
-    @tree.command(
-        name="tw_register",
-        description="Verknüpft deinen Discord-Account mit deinem (bereits bekannten) Ally-Code",
-    )
-    @app_commands.describe(ally_code="Dein Ally-Code, z.B. 123456789 oder 123-456-789")
-    async def tw_register(interaction: discord.Interaction, ally_code: str):
-        # Bewusst offen für alle, keine Rollenprüfung (anders als
-        # /tw_report) -- Verknüpfen des eigenen Ally-Codes ist reine
-        # Selbstauskunft ohne Schreibzugriff auf Konter-/Report-Daten,
-        # verträgt also eine niedrigere Hürde als tatsächliches Reporten.
+    async def _register_discord_user(
+        interaction: discord.Interaction,
+        ally_code: str,
+        target: discord.abc.User,
+        *,
+        for_self: bool,
+    ) -> None:
+        """
+        Gemeinsamer Ablauf für /tw_register (target = der Aufrufer selbst)
+        und /tw_register_other (target = ein anderer Discord-Account):
+        Ally-Code über comlink auflösen, Roster laden, Discord-ID verknüpfen.
+
+        Konfliktbehandlung, VOR den Schreibzugriffen (schlägt der comlink-
+        Abruf fehl, ändert sich nichts):
+        * Hängt target bereits an einem ANDEREN Ally-Code, wird diese alte
+          Verknüpfung gelöst und die neue gesetzt. players.discord_id ist
+          UNIQUE; das direkte UPDATE in db.link_discord_id() warf hier
+          bisher eine unbehandelte sqlite3.IntegrityError (Nutzer sah nur
+          "Anwendung reagiert nicht"). Wer sich mit einem falschen Ally-Code
+          registriert hatte, konnte das nicht selbst korrigieren.
+        * Hängt der Ally-Code bereits an einem ANDEREN Discord-Account, wird
+          er überschrieben (wie bisher) -- aber jetzt in der Antwort genannt.
+        """
         try:
             normalized = roster.normalize_ally_code(ally_code)
         except ValueError as e:
@@ -1373,14 +1386,146 @@ if ROSTER_FEATURE_ENABLED:
             )
             return
 
+        target_id = str(target.id)
+        notes: list[str] = []
+
+        old_link = db.get_player_by_discord_id(target_id)
+        if old_link is not None and old_link["ally_code"] != resolved_ally_code:
+            db.unlink_discord_id(target_id)
+            notes.append(
+                f"Die bisherige Verknüpfung dieses Discord-Accounts mit "
+                f"**{old_link['player_name'] or old_link['ally_code']}** "
+                f"({old_link['ally_code']}) wurde gelöst."
+            )
+
+        existing = db.get_player_by_ally_code(resolved_ally_code)
+        if existing is not None and existing["discord_id"] and existing["discord_id"] != target_id:
+            notes.append(
+                f"Dieser Ally-Code war zuvor mit <@{existing['discord_id']}> verknüpft "
+                f"(`{existing['discord_id']}`) -- überschrieben."
+            )
+
         db.upsert_player(resolved_ally_code, player_name, resolved_player_id)
         await asyncio.to_thread(db.save_roster, resolved_ally_code, player_name, units)
-        db.link_discord_id(resolved_ally_code, str(interaction.user.id))
+        db.link_discord_id(resolved_ally_code, target_id)
 
-        await interaction.followup.send(
-            f"Verknüpft mit **{player_name}** ({resolved_ally_code}) — {len(units)} Einheiten geladen. "
-            f"Dein Roster wird ab jetzt auch beim nächtlichen Gilden-Refresh automatisch aktualisiert."
-        )
+        if for_self:
+            text = (
+                f"Verknüpft mit **{player_name}** ({resolved_ally_code}) — {len(units)} Einheiten geladen. "
+                f"Dein Roster wird ab jetzt auch beim nächtlichen Gilden-Refresh automatisch aktualisiert."
+            )
+        else:
+            text = (
+                f"{target.mention} ist jetzt mit **{player_name}** ({resolved_ally_code}) verknüpft — "
+                f"{len(units)} Einheiten geladen."
+            )
+        if notes:
+            text += "\n" + "\n".join(f"ℹ️ {n}" for n in notes)
+        await interaction.followup.send(text)
+
+    @tree.command(
+        name="tw_register",
+        description="Verknüpft deinen Discord-Account mit deinem (bereits bekannten) Ally-Code",
+    )
+    @app_commands.describe(ally_code="Dein Ally-Code, z.B. 123456789 oder 123-456-789")
+    async def tw_register(interaction: discord.Interaction, ally_code: str):
+        # Bewusst offen für alle, keine Rollenprüfung (anders als
+        # /tw_report) -- Verknüpfen des eigenen Ally-Codes ist reine
+        # Selbstauskunft ohne Schreibzugriff auf Konter-/Report-Daten,
+        # verträgt also eine niedrigere Hürde als tatsächliches Reporten.
+        await _register_discord_user(interaction, ally_code, interaction.user, for_self=True)
+
+    @tree.command(
+        name="tw_register_other",
+        description="Verknüpft einen ANDEREN Discord-Account mit einem Ally-Code (Manager/Admin)",
+    )
+    @app_commands.describe(
+        user="Discord-Account, der verknüpft werden soll",
+        ally_code="Ally-Code dieses Spielers, z.B. 123456789 oder 123-456-789",
+    )
+    async def tw_register_other(
+        interaction: discord.Interaction, user: discord.Member, ally_code: str
+    ):
+        # Anders als /tw_register keine reine Selbstauskunft: wer hier
+        # schreibt, ändert die Zuordnung Ally-Code -> Discord-Account eines
+        # Dritten (und damit, wer in Pings auftaucht). Deshalb Manager/Admin,
+        # wie /tw_guild_set und /tw_roster_refresh.
+        if not is_manager(interaction):
+            await interaction.response.send_message(
+                "Dieser Befehl erfordert Administrator-Rechte oder Manager-Status.",
+                ephemeral=True,
+            )
+            return
+        if user.bot:
+            await interaction.response.send_message(
+                "Bots lassen sich nicht mit einem Ally-Code verknüpfen.", ephemeral=True
+            )
+            return
+        await _register_discord_user(interaction, ally_code, user, for_self=False)
+
+    @tree.command(
+        name="tw_register_list",
+        description="Listet alle bekannten Spieler mit Ally-Code und Discord-Verknüpfung (Manager/Admin)",
+    )
+    @app_commands.describe(nur_offene="Nur Spieler OHNE Discord-Verknüpfung anzeigen")
+    async def tw_register_list(interaction: discord.Interaction, nur_offene: bool = False):
+        if not is_manager(interaction):
+            await interaction.response.send_message(
+                "Dieser Befehl erfordert Administrator-Rechte oder Manager-Status.",
+                ephemeral=True,
+            )
+            return
+
+        players = db.get_all_players()
+        if not players:
+            await interaction.response.send_message(
+                "Noch keine Spieler in der Datenbank. Erst `/tw_guild_set` ausführen "
+                "und den Roster-Refresh abwarten (oder `/tw_roster_refresh`).",
+                ephemeral=True,
+            )
+            return
+
+        def _sort_key(p) -> str:
+            return (p["player_name"] or p["ally_code"]).lower()
+
+        def _name(p) -> str:
+            return p["player_name"] or "(ohne Namen)"
+
+        unlinked = sorted((p for p in players if not p["discord_id"]), key=_sort_key)
+        linked = sorted((p for p in players if p["discord_id"]), key=_sort_key)
+
+        lines = [
+            f"**{len(linked)} von {len(players)} Spielern mit Discord verknüpft.**",
+            "",
+            f"**Nicht verknüpft ({len(unlinked)})**",
+        ]
+        lines += [f"• {_name(p)} — `{p['ally_code']}`" for p in unlinked] or [
+            "*keine — alle verknüpft*"
+        ]
+        if not nur_offene:
+            lines += ["", f"**Verknüpft ({len(linked)})**"]
+            lines += [
+                f"• {_name(p)} — `{p['ally_code']}` — <@{p['discord_id']}> (`{p['discord_id']}`)"
+                for p in linked
+            ] or ["*keine*"]
+
+        # Zeilenweise auf Discords 2000-Zeichen-Limit verteilen (bis zu 50
+        # Spieler mit Mention + ID passen nicht in eine Nachricht).
+        messages: list[str] = []
+        current: list[str] = []
+        current_len = 0
+        for line in lines:
+            if current and current_len + len(line) + 1 > _DISCORD_MESSAGE_LIMIT:
+                messages.append("\n".join(current))
+                current, current_len = [], 0
+            current.append(line)
+            current_len += len(line) + 1
+        if current:
+            messages.append("\n".join(current))
+
+        await interaction.response.send_message(messages[0], ephemeral=True)
+        for extra in messages[1:]:
+            await interaction.followup.send(extra, ephemeral=True)
 
     @tree.command(
         name="tw_roster_refresh",
@@ -1800,6 +1945,19 @@ async def tw_help(interaction: discord.Interaction):
             "**`/tw_roster_refresh`** — *Manager/Admin*\n"
             "Aktualisiert die Rosterdaten der gesamten Gilde sofort, statt auf den "
             "nächtlichen automatischen Refresh zu warten.",
+        )
+        sections.insert(
+            9,
+            "**`/tw_register_other user ally_code`** — *Manager/Admin*\n"
+            "Verknüpft einen anderen Discord-Account mit einem Ally-Code (für Mitglieder, "
+            "die sich nicht selbst registriert haben).",
+        )
+        sections.insert(
+            10,
+            "**`/tw_register_list [nur_offene]`** — *Manager/Admin*\n"
+            "Listet alle bekannten Spieler mit Ally-Code und Discord-ID, getrennt nach "
+            "verknüpft/nicht verknüpft. Mit `nur_offene: True` nur die noch nicht "
+            "registrierten.",
         )
 
     messages: list[str] = []

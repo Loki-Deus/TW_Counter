@@ -534,6 +534,37 @@ def link_discord_id(ally_code: str, discord_id: str) -> None:
         )
 
 
+def get_player_by_ally_code(ally_code: str) -> sqlite3.Row | None:
+    """Ein Spieler über den Ally-Code, oder None, wenn unbekannt."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM players WHERE ally_code = ?", (ally_code,)
+        ).fetchone()
+
+
+def get_player_by_discord_id(discord_id: str) -> sqlite3.Row | None:
+    """Der Spieler, dem diese Discord-ID zugeordnet ist, oder None.
+    discord_id ist UNIQUE -- es gibt höchstens einen."""
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM players WHERE discord_id = ?", (discord_id,)
+        ).fetchone()
+
+
+def unlink_discord_id(discord_id: str) -> None:
+    """Löst die Discord-Verknüpfung dieser ID (setzt discord_id auf NULL),
+    lässt den players-Datensatz und das Roster unangetastet. Nötig vor
+    link_discord_id(), wenn dieselbe Discord-ID bereits an einem ANDEREN
+    Ally-Code hängt: discord_id ist UNIQUE, das direkte UPDATE würde mit
+    sqlite3.IntegrityError scheitern (ließ sich vorher über /tw_register mit
+    einem zweiten Ally-Code auslösen)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE players SET discord_id = NULL WHERE discord_id = ?",
+            (discord_id,),
+        )
+
+
 def get_all_players() -> list[sqlite3.Row]:
     """
     Alle bekannten Spieler, ob mit Discord verknüpft oder nicht -- nicht

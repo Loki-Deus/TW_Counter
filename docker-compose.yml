@@ -38,15 +38,17 @@ services:
       - DISCORD_TOKEN=${TB_DISCORD_TOKEN}
       # Geteilt mit tw-counter -- derselbe Discord-Server, siehe .env.example.
       - GUILD_ID=${GUILD_ID}
-      - TW_CHANNEL_ID=${TW_CHANNEL_ID}
-      - OFFICER_ID=${OFFICER_ID}
+      - TB_CHANNEL_ID=${TB_CHANNEL_ID}
+      # Kanal rote-organisation: Auswahl-Dialoge und Bot-Hinweise (ersetzt
+      # die frühere DM an OFFICER_ID).
+      - ORG_CHANNEL_ID=${ORG_CHANNEL_ID}
       - MANAGER_IDS=${TB_MANAGER_IDS}
       - MEMBER_ROLE_ID=${TB_MEMBER_ROLE_ID}
       - DATA_DIR=/app/data
       - BOT_TIMEZONE=${BOT_TIMEZONE:-Europe/Vienna}
       # Read-only Zugriff auf tw-counters Roster-Mirror (players,
-      # roster_units, unit_names) für /tbreminder_platoons_check und
-      # /tbreminder_platoons_ping -- siehe volumes unten. Hartkodiert wie
+      # roster_units, unit_names) für /tbreminder_planets_check,
+      # /tbreminder_planets_ping und /tbreminder_units_* -- siehe volumes unten. Hartkodiert wie
       # COMLINK_URL oben, muss zum :ro-Mount-Pfad passen bleiben.
       - ROSTER_DB_PATH=/app/roster-data/counters.db
     volumes:
